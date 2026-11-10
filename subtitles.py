@@ -27,7 +27,9 @@ def get_whisper_config():
 
 # Decode params shared by both transcription paths. condition_on_previous_text
 # is off to avoid repetition/hallucination loops; vad_filter drops silence.
+# task: "transcribe" (same language) | "translate" (foreign audio to English subtitles).
 WHISPER_TRANSCRIBE_PARAMS = {
+    "task": os.environ.get("WHISPER_TASK", "transcribe").strip().lower(),
     "beam_size": 5,
     "vad_filter": True,
     "condition_on_previous_text": False,

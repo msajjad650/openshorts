@@ -244,9 +244,10 @@ def _transcribe_with_whisper(media_path):
         })
         text_parts.append(segment.text.strip())
 
+    task = os.environ.get("WHISPER_TASK", "transcribe").strip().lower()
     return {
         "text": " ".join(part for part in text_parts if part),
-        "language": info.language,
+        "language": "en" if task == "translate" else info.language,
         "segments": out_segments,
     }
 
@@ -659,6 +660,9 @@ def transcribe_media(media_path):
             "speech, so it needs a video with audio.")
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+    task = os.environ.get("WHISPER_TASK", "transcribe").strip().lower()
+    if task == "translate":
+        backend = "whisper"
 
     if backend == "parakeet":
         try:

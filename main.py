@@ -1392,13 +1392,25 @@ def auto_hook_clip(clip_path, clip, captions=None, mark=False):
     the served ``wm_`` copy of the captioned file, so mark_delivery finds it
     made instead of decoding the captioned file again for its own pass."""
     text = (clip.get('viral_hook_text') or '').strip()
+    teaser_info = clip.get('teaser_intro')
+    if teaser_info:
+        heading = os.environ.get("TEASER_HEADING", "Coming up").strip()
+        include_hook = os.environ.get("TEASER_INCLUDE_HOOK_TEXT", "1").strip() != "0"
+        if heading:
+            if text and include_hook:
+                text = f"{heading}\n{text}"
+            else:
+                text = heading
+        seconds = float(teaser_info.get("duration", 5.0))
+    else:
+        try:
+            seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
+        except ValueError:
+            seconds = 5.0
+
     if not text:
         return None
     style = os.environ.get("AUTO_HOOK_STYLE", "pill")
-    try:
-        seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
-    except ValueError:
-        seconds = 5.0
     try:
         from hooks import add_hook_to_video, HOOK_STYLES
         if style not in HOOK_STYLES:
@@ -2775,6 +2787,30 @@ if __name__ == '__main__':
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
+            def _find_climax_from_hook(trans, s_time, e_time, hook_text):
+                """Find the timestamp where viral_hook_text is spoken within [s_time, e_time]."""
+                if not hook_text or not trans or not isinstance(trans, dict):
+                    return None, None
+                raw_words = [re.sub(r"[^a-zA-Z0-9]", "", w.lower()) for w in str(hook_text).split()]
+                hook_words = [w for w in raw_words if len(w) > 2]
+                if not hook_words:
+                    return None, None
+                best_time = None
+                max_matches = 0
+                for seg in trans.get("segments", []) or []:
+                    s, e = seg.get("start", 0), seg.get("end", 0)
+                    if e < s_time or s > e_time:
+                        continue
+                    seg_text = seg.get("text", "").lower()
+                    matches = sum(1 for hw in hook_words if hw in seg_text)
+                    if matches > max_matches and matches >= max(1, len(hook_words) // 2):
+                        max_matches = matches
+                        best_time = s
+                if best_time is not None:
+                    teaser_sec = float(os.environ.get("TEASER_MAX_SECONDS", "5.0"))
+                    return round(float(best_time), 3), round(min(float(e_time), float(best_time) + teaser_sec), 3)
+                return None, None
+
             def _process_one_clip(i, clip):
                 start = clip['start']
                 end = clip['end']
@@ -2785,9 +2821,54 @@ if __name__ == '__main__':
                 clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
                 clip_final_path = os.path.join(output_dir, clip_filename)
 
+                # Automated teaser / cold open intro
+                auto_teaser = os.environ.get("AUTO_TEASER_INTRO", "1").strip() != "0"
+                climax_start = clip.get('climax_start')
+                climax_end = clip.get('climax_end')
+
+                if auto_teaser and (climax_start is None or climax_end is None):
+                    c_s, c_e = _find_climax_from_hook(transcript, start, end, clip.get('viral_hook_text'))
+                    if c_s is not None and c_e is not None:
+                        climax_start, climax_end = c_s, c_e
+
+                teaser_active = False
+                clip_transcript = transcript
+                effective_start = start
+                effective_end = end
+
+                if auto_teaser and climax_start is not None and climax_end is not None:
+                    try:
+                        c_start = float(climax_start)
+                        c_end = float(climax_end)
+                        if c_start >= (start + 3.0) and c_start < end:
+                            max_teaser_sec = float(os.environ.get("TEASER_MAX_SECONDS", "5.0"))
+                            duration = min(max_teaser_sec, max(2.0, c_end - c_start))
+                            c_end = min(end, c_start + max_teaser_sec)
+                            duration = round(c_end - c_start, 3)
+                            teaser_segments = [
+                                {"start": round(c_start, 3), "end": round(c_end, 3)},
+                                {"start": round(start, 3), "end": round(end, 3)}
+                            ]
+                            import recut
+                            recut.run_cut_concat(input_video, teaser_segments, clip_temp_path, output_dir)
+                            teaser_active = True
+                            clip_transcript = recut.virtual_transcript(transcript, teaser_segments)
+                            effective_start = 0.0
+                            effective_end = recut.total_duration(teaser_segments)
+                            clip['teaser_intro'] = {
+                                "climax_start": c_start,
+                                "climax_end": c_end,
+                                "duration": duration
+                            }
+                            print(f"   ⚡ Spliced {duration:.1f}s teaser intro [{c_start:.1f}s - {c_end:.1f}s] before main clip")
+                    except Exception as e:
+                        print(f"   ⚠️ Could not splice teaser intro ({e}), falling back to linear cut")
+                        teaser_active = False
+
                 try:
-                    # ffmpeg cut — re-encoding for precision on strict seconds
-                    cut_clip(input_video, clip_temp_path, start, end, i + 1)
+                    if not teaser_active:
+                        # ffmpeg cut — re-encoding for precision on strict seconds
+                        cut_clip(input_video, clip_temp_path, start, end, i + 1)
 
                     # Layer order: the canonical reframe stays CLEAN, the hook
                     # is a derived hooked_ file, captions go last on top of
@@ -2809,16 +2890,17 @@ if __name__ == '__main__':
                     # The hook was written from the transcript alone. When the
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
-                    if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
-                        hook_grounding.reground(clip_final_path, clip, transcript, start, end)
+                    if success and hook_grounding.wanted(clip['layout_ranges'], effective_end - effective_start):
+                        hook_grounding.reground(clip_final_path, clip, clip_transcript, effective_start, effective_end)
                     captioned = None
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])
-                    if success and os.environ.get("AUTO_HOOK") == "1":
+                    has_hook = bool((clip.get('viral_hook_text') or '').strip()) or bool(clip.get('teaser_intro'))
+                    if success and (os.environ.get("AUTO_HOOK") == "1" or teaser_active):
                         # Captions ride the hook's ffmpeg (one decode, two
                         # outputs) when both are on; see auto_hook_clip.
                         plan = None
-                        if (clip.get('viral_hook_text') or '').strip():
-                            plan = auto_caption_clip(clip_final_path, transcript, start, end,
+                        if has_hook:
+                            plan = auto_caption_clip(clip_final_path, clip_transcript, effective_start, effective_end,
                                                      split_ranges=split_ranges, plan_only=True)
                         hooked = auto_hook_clip(clip_final_path, clip, captions=plan,
                                                 mark=os.environ.get("WATERMARK") == "1")
@@ -2828,7 +2910,7 @@ if __name__ == '__main__':
                     if success:
                         if not captioned:
                             captioned = auto_caption_clip(
-                                deliver_path, transcript, start, end,
+                                deliver_path, clip_transcript, effective_start, effective_end,
                                 split_ranges=split_ranges,
                                 mark=os.environ.get("WATERMARK") == "1")
                         served = captioned or deliver_path

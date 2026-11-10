@@ -44,6 +44,8 @@ class DetailClipModel(BaseModel):
     # the dashboard. Defaulted so a small local model that skips it does not
     # fail schema validation and lose the clip.
     why: str = ""
+    climax_start: Optional[float] = None
+    climax_end: Optional[float] = None
 
 
 class DetailResponse(BaseModel):
@@ -251,7 +253,51 @@ def _log(message: str) -> None:
         stream.write(safe_text + "\n")
     stream.flush()
 
-SCORE_PROMPT_TEMPLATE = """
+
+PROMPT_PROFILES = {
+    "podcast": {
+        "score": """- PODCAST & TALKING POINTS FOCUS:
+  * SCORE HIGH (70-100): Thought-provoking insights, surprising revelations, counter-intuitive perspectives, gripping personal stories, heated debates/disagreements, actionable life advice, and memorable quotable one-liners.
+  * SCORE LOW (0-30): Sponsor reads, housekeeping ("like and subscribe", tour dates), rambling intros/outros, mundane small talk, audio checks, or unfinished thoughts that lack a clear takeaway.""",
+        "detail": """- PODCAST & TALKING POINTS FOCUS:
+  * Prioritize compelling talking points, counter-intuitive perspectives, mind-blowing facts, emotional or vulnerable storytelling, and punchy debates between host and guest.
+  * Avoid sponsor reads, housekeeping/plugs, awkward silences, rambling throat-clearing before getting to the point, and inside jokes that need prior context."""
+    },
+    "streamer": {
+        "score": """- STREAMER FOCUS (HASANABI / LIVE COMMENTARY):
+  * SCORE HIGH (70-100): Strong political/cultural takes, explosive emotional reactions (shouting, desk slams, intense disbelief, laughter), debate takedowns of news/videos, roasts, surprising arguments or facts, and quotable statements.
+  * SCORE LOW (0-30): Long silence or dead air while silently reading articles/Twitter, reading chat in a monotone voice, TTS donation reading, subscriber goals/merch plugs, and casual gaming with low commentary.""",
+        "detail": """- STREAMER FOCUS (HASANABI / LIVE COMMENTARY):
+  * Prioritize high-energy moments, passionate rants and takes, explosive reactions, sharp roasts, and unexpected arguments.
+  * Avoid mid-conversation pauses where the streamer is silently reading chat/articles or reading donation TTS."""
+    }
+}
+
+
+def _get_active_prompt_profile():
+    mode = os.environ.get("PROMPT_MODE", os.environ.get("CLIP_MODE", "podcast")).strip().lower()
+    profile = dict(PROMPT_PROFILES.get(mode, PROMPT_PROFILES["podcast"]))
+    custom = os.environ.get("CUSTOM_GUIDANCE", "").strip()
+    if custom:
+        profile["score"] += f"\n- ADDITIONAL USER GUIDANCE:\n  {custom}"
+        profile["detail"] += f"\n- ADDITIONAL USER GUIDANCE:\n  {custom}"
+    return profile
+
+
+class DynamicPrompt(str):
+    def __new__(cls, template_str, stage):
+        obj = super().__new__(cls, template_str)
+        obj.stage = stage
+        return obj
+
+    def format(self, *args, **kwargs):
+        if "content_focus" not in kwargs:
+            profile = _get_active_prompt_profile()
+            kwargs["content_focus"] = profile.get(self.stage, "")
+        return super().format(*args, **kwargs)
+
+
+SCORE_PROMPT_TEMPLATE = DynamicPrompt("""
 You are a senior short-form video strategist.
 RANK these candidate windows by how well each would work as a standalone short.
 
@@ -269,6 +315,7 @@ Rules:
   work with prior context score low.
 - Prefer windows with strong hooks, conflict, surprise, outrage, emotion,
   novelty, big numbers, or a clear payoff.
+{content_focus}
 - A window may carry `viewers_clipped` / `viewer_clip_views`: the stream's own
   live viewers clipped that stretch themselves. That is strong evidence the
   moment lands even when the transcript looks thin (a chase, a crash, a scream),
@@ -291,9 +338,9 @@ Return only:
     }}
   ]
 }}
-"""
+""", "score")
 
-DETAIL_PROMPT_TEMPLATE = """
+DETAIL_PROMPT_TEMPLATE = DynamicPrompt("""
 You are a senior short-form video editor and viral copywriter.
 Choose the BEST short clips from these shortlisted candidate windows.
 
@@ -303,6 +350,8 @@ CLIP RULES:
 - Stay within the candidate window boundaries.
 - THE 2-SECOND RULE: the clip MUST open on its strongest moment. If the first
   2 seconds would not stop a cold viewer from scrolling, move the start or skip the clip.
+{content_focus}
+- CLIMAX / TEASER MOMENT: For each clip, identify the exact 4-5 second timestamp range (`climax_start` and `climax_end`, in absolute seconds) inside this clip containing the emotional peak, loudest reaction, punchline, or quote. If the clip already begins directly with this peak (within the first 2 seconds), set `climax_start` equal to `start`.
 - Start slightly before the hook and end slightly after the payoff when possible.
 - When a window has `viewer_moments` ([start, end] stretches the stream's
   viewers clipped), the best clip of that window should cover the strongest
@@ -365,11 +414,13 @@ Return only:
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
       "viral_hook_text": "<short overlay max 10 words>",
-      "why": "<one sentence, max 20 words>"
+      "why": "<one sentence, max 20 words>",
+      "climax_start": <number or null>,
+      "climax_end": <number or null>
     }}
   ]
 }}
-"""
+""", "detail")
 
 
 def _strip_code_fences(text: str) -> str:

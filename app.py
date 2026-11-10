@@ -46,7 +46,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "8192"))  # 8GB limit (env-configurable)
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST

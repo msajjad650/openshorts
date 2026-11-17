@@ -62,6 +62,8 @@ _ASR_GATE = threading.Semaphore(_ASR_SLOTS)
 # once. Peak per transcription is ~4-6 GB on a 20 GB card (prod, 22-sep-2026).
 ASR_HOST_SLOTS = int(os.environ.get("ASR_HOST_SLOTS", "2"))
 ASR_LOCK_DIR = os.environ.get("ASR_LOCK_DIR", "output")
+# Seconds this process waited for a host slot (main.py reports it in JOB_CPU).
+ASR_WAIT = {"s": 0.0}
 
 
 class host_asr_slot:
@@ -87,6 +89,7 @@ class host_asr_slot:
         except Exception:
             return self
         announced = False
+        started = time.monotonic()
         while True:
             for i in range(self.slots):
                 path = os.path.join(self.lock_dir, f".asr-gpu-{i}.lock")
@@ -97,6 +100,7 @@ class host_asr_slot:
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     self._fh = fh
+                    ASR_WAIT["s"] += time.monotonic() - started
                     return self
                 except OSError:
                     fh.close()
@@ -319,16 +323,94 @@ def vad_load_kwargs():
     return {"sess_options": opts, "providers": ["CPUExecutionProvider"]}
 
 
+# Where the last Parakeet load runs: "cuda", "cpu", or None before any load.
+# main.py reports it in the job's JOB_CPU line.
+PARAKEET_DEVICE = None
+
+
+def onnxruntime_device():
+    """"cuda" when the installed onnxruntime build has the CUDA provider.
+
+    onnxruntime and onnxruntime-gpu are two wheels of one import package, and
+    whichever was unpacked last is the build that runs. With the CPU wheel on
+    top, asking for CUDAExecutionProvider only raises a UserWarning and
+    Parakeet silently runs on the CPU: many times slower, on every core.
+    """
+    try:
+        import onnxruntime as rt
+        providers = rt.get_available_providers()
+    except Exception:
+        return "cpu"
+    return "cuda" if "CUDAExecutionProvider" in providers else "cpu"
+
+
+PARAKEET_HF_REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+
+
+def _plain_parakeet_dir():
+    """The model's files as ordinary files in one directory, copied once from
+    the hub cache (see ``_load_parakeet``). Several job processes may get here
+    together: each copies to its own temp dir and the first rename wins."""
+    import shutil
+    import tempfile
+    from huggingface_hub import try_to_load_from_cache
+    # Not snapshot_download: the cache only has the files the loader asked
+    # for, and an incomplete snapshot is an error there.
+    cached = try_to_load_from_cache(PARAKEET_HF_REPO, "encoder-model.onnx")
+    if not isinstance(cached, str):
+        raise RuntimeError("Parakeet is not in the hub cache")
+    snap = os.path.dirname(cached)
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(snap))),
+                        "openshorts-plain")
+    target = os.path.join(root, f"parakeet-{os.path.basename(snap)}")
+    if os.path.isdir(target):
+        return target
+    os.makedirs(root, exist_ok=True)
+    tmp = tempfile.mkdtemp(dir=root, prefix=".copy-")
+    try:
+        for name in os.listdir(snap):
+            if "int8" in name:
+                continue          # the quantised twin is never loaded
+            shutil.copyfile(os.path.join(snap, name), os.path.join(tmp, name))
+        try:
+            os.rename(tmp, target)
+        except OSError:
+            if not os.path.isdir(target):
+                raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return target
+
+
+def _load_parakeet(onnx_asr):
+    """Load Parakeet from the hub cache. A cache written by a recent
+    huggingface_hub keeps every file as a link into its own blob directory,
+    and onnxruntime refuses a model whose external weights (``.onnx.data``)
+    resolve outside the model file's directory: the load then fails on a
+    fresh cache while an old one still works. Same files from a plain
+    directory load fine, so that is the fallback."""
+    kwargs = dict(providers=parakeet_providers(), sess_options=parakeet_session_options())
+    try:
+        return onnx_asr.load_model(PARAKEET_MODEL_ID, **kwargs)
+    except Exception as e:
+        if "External data path" not in str(e):
+            raise
+    return onnx_asr.load_model(PARAKEET_MODEL_ID, _plain_parakeet_dir(), **kwargs)
+
+
 def _get_parakeet_model():
-    global _parakeet_model
+    global _parakeet_model, PARAKEET_DEVICE
     with _parakeet_lock:
         if _parakeet_model is None:
             import onnx_asr
-            model = onnx_asr.load_model(PARAKEET_MODEL_ID, providers=parakeet_providers(),
-                                        sess_options=parakeet_session_options())
+            model = _load_parakeet(onnx_asr)
             vad = onnx_asr.load_vad("silero", **vad_load_kwargs())
             _parakeet_model = model.with_vad(
                 vad, batch_size=PARAKEET_VAD_BATCH).with_timestamps()
+            PARAKEET_DEVICE = onnxruntime_device()
+            if PARAKEET_DEVICE != "cuda":
+                print("⚠️ [ASR] parakeet runs on the CPU: this onnxruntime build "
+                      "has no CUDAExecutionProvider", flush=True)
     return _parakeet_model
 
 

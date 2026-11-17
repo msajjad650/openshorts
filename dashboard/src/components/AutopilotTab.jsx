@@ -4,7 +4,9 @@ import {
   Clock, Scissors, Send, ExternalLink, FolderOpen, Lock,
 } from 'lucide-react';
 import { apiJson, openQuotaWall } from '../lib/api';
+import { PLATFORM_VALUES, platformLabel } from '../lib/socialPlatforms';
 import { track } from '../lib/analytics';
+import { connectNotice } from '../lib/connectReturn';
 
 // Autopilot: every new video on the user's connected YouTube channel is turned
 // into shorts automatically, and optionally the best ones are scheduled on
@@ -12,7 +14,8 @@ import { track } from '../lib/analytics';
 // the app already uses for posting (GET /api/uploadposts/media under the hood),
 // so there is nothing to paste: connect once, switch it on.
 
-const PLATFORM_LABELS = { tiktok: 'TikTok', instagram: 'Instagram', youtube: 'YouTube Shorts' };
+const PLATFORM_LABELS = Object.fromEntries(
+  PLATFORM_VALUES.map((v) => [v, v === 'youtube' ? 'YouTube Shorts' : platformLabel(v)]));
 
 const ERROR_TEXT = {
   plan_required: 'Autopilot is paused: it needs an active Starter, Creator or Pro plan.',
@@ -121,11 +124,19 @@ export default function AutopilotTab({ onOpenProject, onUpgrade, justConnected }
 
   useEffect(() => { load(); }, [load]);
 
-  // Coming back from the connect page (#app?tab=autopilot&connected=1).
+  // Coming back from the connect page (#app?tab=autopilot&connected=1). The
+  // outcome decides the notice: a cancel or a failure also comes back here,
+  // and the page's own back button carries no outcome (no notice then).
   useEffect(() => {
-    if (justConnected) {
-      setNotice('Accounts connected.');
-      track('AutopilotChannelConnected');
+    if (!justConnected) return;
+    setNotice(connectNotice(justConnected));
+    const props = { platform: justConnected.platform || 'unknown' };
+    if (justConnected.status === 'success') {
+      track('AutopilotChannelConnected', { props });
+    } else {
+      track('AutopilotConnectFailed', {
+        props: { ...props, status: justConnected.status, error_code: justConnected.errorCode || 'none' },
+      });
     }
   }, [justConnected]);
 
@@ -221,7 +232,7 @@ export default function AutopilotTab({ onOpenProject, onUpgrade, justConnected }
   const twitchAvailable = !!data?.twitch_available;
   const accounts = data?.accounts || {};
   const eligible = !!data?.eligible;
-  const limits = data?.limits || { max_minutes_choices: [10, 20, 30, 45, 60, 90], max_clips_to_publish: 5, platforms: ['tiktok', 'instagram', 'youtube'] };
+  const limits = data?.limits || { max_minutes_choices: [10, 20, 30, 45, 60, 90], max_clips_to_publish: 5, platforms: PLATFORM_VALUES };
   const runs = data?.runs || [];
   const errorText = s.enabled && s.last_error ? ERROR_TEXT[s.last_error] : null;
 

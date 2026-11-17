@@ -28,7 +28,8 @@ day. Paid plans only (it spends minutes unattended).
   A guarded UPDATE (`status='processing'` → final) makes it once-only; it sends
   the Autopilot email (replacing the generic clips-ready one) and, with
   autopublish on, uploads the top `clips_to_publish` clips by `predicted_score`
-  to Upload-Post in a background task, scheduled one a day at `publish_hour` in
+  to Upload-Post in a background task (any of `social_platforms.PLATFORMS` the
+  user picked; per-network fields from `social_platforms.upload_fields`), scheduled one a day at `publish_hour` in
   the user's IANA `timezone`. Runs stuck in processing for 6 h are marked
   `timeout`.
 - `AUTOPILOT_DISABLED=1` turns the poller off without touching the API.
@@ -52,6 +53,9 @@ endpoint and to offer Twitch on the connect page. With the flag on:
   credentials or viewer clips it falls back to `max_minutes` from the start.
 - The connect page lists Twitch (`social_profiles.connect_platforms`). It is
   read-only: Autopilot never publishes to Twitch.
+- `/auto-clip`, `/platforms/twitch`, `/gta-6-clips` and `/wow-forever-clips`
+  state these rules and the viewer-clips signal below (`TWITCH_AUTOPILOT_*` in
+  `dashboard/seo/pages.js`); if they change, change the copy too.
 
 ## Viewer clips as a selection signal (`twitch_signals.py`)
 

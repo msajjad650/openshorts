@@ -3,6 +3,7 @@
 Tracks recent managed-job outcomes in memory and emails ADMIN_EMAIL (via Resend)
 when something looks broken, with a per-alert cooldown so it never spams.
 """
+import html as _html
 import asyncio
 import os
 import time
@@ -96,6 +97,24 @@ def user_ref(user_id) -> str:
     return f"user {ref[:8]}" if ref else "a user"
 
 
+class TelegramSendError(RuntimeError):
+    """A failed Bot API call, its text already free of the bot token and the
+    chat id (httpx puts the request URL, token included, in its messages)."""
+
+
+def redact_telegram(text) -> str:
+    """``text`` without the bot token or the chat id, for logs and errors."""
+    out = str(text)
+    for secret, label in ((settings.telegram_bot_token, "<bot-token>"),
+                          (settings.telegram_chat_id, "<chat-id>")):
+        secret = str(secret or "").strip()
+        if len(secret) >= 4:
+            out = out.replace(secret, label)
+    # Any other bot URL that slipped in (a token rotated mid-flight).
+    import re
+    return re.sub(r"/bot[0-9]+:[A-Za-z0-9_-]+", "/bot<bot-token>", out)
+
+
 async def send_telegram(text: str, *, raise_errors: bool = False):
     """Push a plain-text message to the admin's Telegram chat. No-op if unset.
 
@@ -105,6 +124,7 @@ async def send_telegram(text: str, *, raise_errors: bool = False):
     """
     if not settings.telegram_configured:
         return
+    failure = None
     try:
         import httpx
         url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
@@ -115,9 +135,14 @@ async def send_telegram(text: str, *, raise_errors: bool = False):
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
     except Exception as e:
-        if raise_errors:
-            raise
-        print(f"⚠️  Telegram alert failed: {e}")
+        failure = redact_telegram(f"{type(e).__name__}: {e}")
+    if failure is None:
+        return
+    if raise_errors:
+        # Raised outside the handler, so the original (whose message, args and
+        # request carry the token-bearing URL) is not even its context.
+        raise TelegramSendError(failure)
+    print(f"⚠️  Telegram alert failed: {failure}")
 
 
 async def send_admin_alert(subject: str, body: str):
@@ -131,7 +156,9 @@ async def send_admin_alert(subject: str, body: str):
             print(f"⚠️  [ADMIN ALERT] {subject}\n{body[:500]}"
                   + ("" if to else "  (set ADMIN_EMAIL + SMTP_* or TELEGRAM_* to receive these)"))
         return
-    html = f"<pre style='font:13px/1.5 monospace;white-space:pre-wrap'>{body}</pre>"
+    # The body quotes job logs and error text: text, never markup.
+    html = ("<pre style='font:13px/1.5 monospace;white-space:pre-wrap'>"
+            f"{_html.escape(str(body))}</pre>")
     await send_email(to, f"[OpenShorts] {subject}", html)
 
 

@@ -27,7 +27,8 @@ def setup_sync(app):
     app.add_middleware(SessionMiddleware, secret_key=settings.jwt_secret)
 
     from . import (auth, oauth, billing, social_profiles, videos, api_keys,
-                   account, mcp_oauth, marketing, autopilot, lifecycle, cancellation, onboarding)  # noqa: F401
+                   account, mcp_oauth, marketing, autopilot, lifecycle, cancellation,  # noqa: F401
+                   onboarding, support_ops)
     oauth.register()
     billing._init_stripe()
     app.include_router(auth.router)
@@ -47,19 +48,29 @@ def setup_sync(app):
     # Unsubscribe from commercial email (LSSI art. 21.2): the out-of-minutes
     # upsell and the lifecycle emails (cloud/lifecycle.py).
     app.include_router(marketing.router)
+    # Support back-office API (cloud/support_ops.py): 404 everywhere unless
+    # its keys are set; no UI, no OpenAPI entry, no CORS.
+    support_ops.load_keys()
+    app.include_router(support_ops.router)
 
 
-async def setup_async(app, keep_reservation_ids=None):
+async def setup_async(app, keep_reservation_ids=None, live_reservation_ids=None,
+                      sweep_active=None, booted_at=None):
     """Async initialization done inside the FastAPI lifespan.
 
     DB engine, orphaned-reservation cleanup and the metering sweeper live here.
     ``keep_reservation_ids`` belong to jobs being resumed after a restart and
     must not be refunded (see app._resume_interrupted_jobs).
+    ``live_reservation_ids`` is a callable the sweeper asks, every pass, which
+    reservations belong to jobs still alive (app._live_reservation_ids);
+    ``sweep_active`` is False while the instance drains. ``booted_at``: only
+    reservations created before it can be orphans of this boot.
     """
     from . import database, digest, metering, videos
     await database.init_engine()
-    await metering.release_orphaned_reservations(keep_ids=keep_reservation_ids)
-    metering.start_sweeper()
+    await metering.release_orphaned_reservations(keep_ids=keep_reservation_ids,
+                                                 created_before=booted_at)
+    metering.start_sweeper(live_ids=live_reservation_ids, is_active=sweep_active)
     videos.start_sweeper()
     digest.start_digest()
     print("☁️  Cloud billing mode ENABLED (DB ready, metering active).")

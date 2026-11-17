@@ -5,6 +5,7 @@ import shutil
 import argparse
 import re
 import sys
+import contextlib
 import threading
 import unicodedata
 import uuid
@@ -29,6 +30,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
@@ -908,22 +910,15 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
-        try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 # Never print file CONTENT here: with a headerless cookies
-                 # blob this would leak live YouTube session cookies to logs.
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-        except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
+    # The account this video uses (one of YOUTUBE_COOKIES, YOUTUBE_COOKIES_2,
+    # ...), as a private cookie file. Never print its CONTENT: it is a live
+    # YouTube session.
+    yt_session = yt_account.Session()
+    cookies_path = yt_session.path
+    if cookies_path:
+        print(f"🍪 Using YouTube account {yt_session.account + 1} of "
+              f"{len(yt_account.accounts())}.")
     else:
-        cookies_path = None
         print("⚠️ YOUTUBE_COOKIES env var not found.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
@@ -979,6 +974,10 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     def _base_opts(extractor_args, proxy, cookies=True):
         return {
             'quiet': False, 'verbose': True, 'no_warnings': False,
+            # No progress lines: one per update of every download filled the
+            # API log, rotating it away within minutes. The start, the
+            # "Download completed" line, errors and retries still print.
+            'noprogress': True,
             'cookiefile': cookies_path if (cookies and cookies_path) else None,
             'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
             'nocheckcertificate': True, 'cachedir': False,
@@ -1067,8 +1066,12 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         # Extracted ONCE, unprocessed, and handed to the download below: a
         # plain ydl.download([url]) ran the whole extraction again (player
         # clients, API JSON, m3u8), 4-9 s of round trips per attempt.
-        with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
-            info = ydl.extract_info(url, download=False, process=False)
+        # An extraction that sends the account's cookies takes one of the
+        # account's slots and keeps its distance from the previous one
+        # (yt_account): the account's request budget is shared by every job.
+        with (yt_session.request() if (cookies and cookies_path) else contextlib.nullcontext()):
+            with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
+                info = ydl.extract_info(url, download=False, process=False)
         # Media URLs another program will fetch (ffmpeg on a ranged or HLS
         # download) resolve outside the Python guard: check them here. YouTube's
         # own CDN hosts are skipped (dozens of them, never internal).
@@ -1154,7 +1157,23 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     # below so app.py can keep a durable trail of WHY a job reached the paid
     # proxy (the container log rotates within the hour; see cloud/proxy_ledger).
     attempt_log = []
+    account_limited = False
+    skip_told = False
     for label, ea, fmt, proxy, cookies in attempts:
+        if cookies and cookies_path and yt_session.spent:
+            # YouTube said twice for this video (or, during a cooldown, to
+            # everybody) that the account is limited: one more request with
+            # its cookies gets the same answer and counts against the account
+            # again. One answer is not enough to stop: the limit is often on
+            # one exit IP only, and the next static route gets the video.
+            if not skip_told:
+                print("⏳ The YouTube account is limited: skipping the rest of "
+                      "the attempts that use it.")
+                skip_told = True
+            account_limited = True
+            attempt_log.append({"label": label, "ok": False, "bytes": 0, "paid": False,
+                                "error": "skipped: the YouTube account is cooling down"})
+            continue
         # A 403 on the media fetch is usually transient: the googlevideo URL is
         # bound to the IP that extracted it, and the residential proxy rotates
         # its exit IP between requests. Retrying re-extracts and usually lands
@@ -1163,6 +1182,8 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             try:
                 print(f"📥 Download attempt: {label}" + (f" (retry {retry})" if retry else ""))
                 sanitized_title = _attempt(ea, fmt, proxy, cookies)
+                if cookies and cookies_path:
+                    yt_session.ok()
                 # Only bytes through the PER-GB proxy cost money; direct and
                 # the flat-rate static proxies are free bandwidth for the
                 # monthly counter's purposes.
@@ -1179,6 +1200,12 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                                     "paid": proxy is not None and proxy == _proxy,
                                     "error": str(e)[:300]})
                 print(f"⚠️  Download attempt '{label}' failed: {str(e)[:200]}")
+                if cookies and yt_account.is_rate_limit(str(e)):
+                    account_limited = True
+                    if yt_session.limited():
+                        print(f"🔁 Moving this video to YouTube account "
+                              f"{yt_session.account + 1}.")
+                    break       # not again on this route; the next one may differ
                 retryable = '403' in str(e) or 'Forbidden' in str(e)
                 if not retryable or retry == 1:
                     break
@@ -1198,6 +1225,14 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     if sanitized_title is None and last_err is not None and _content_block(str(last_err)):
         print(f"❌ {_content_block(str(last_err))}")
         raise last_err
+
+    if sanitized_title is None and account_limited:
+        # Not the video's fault and not worth a failure: app.py puts the job
+        # back in line once the cooldown is over (consumed there, like
+        # PROXY_BYTES; never shown to the user).
+        print(f"YT_ACCOUNT_LIMITED {yt_account.cooling_down():.0f}", flush=True)
+        if last_err is None:      # every attempt needed the account
+            last_err = RuntimeError("The YouTube account is rate-limited by YouTube.")
 
     if sanitized_title is None:
         import sys
@@ -2507,11 +2542,42 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--prepare-only', action='store_true',
+                        help="Fetch the source (download, cut to the paid minutes), print "
+                             "SOURCE_READY <path> and exit: a remote worker renders it.")
 
     args = parser.parse_args()
     output_format = args.format
 
     script_start_time = time.time()
+
+    # Every encode of this job (bin/ffmpeg, gpu_render) that waits for an
+    # NVENC slot appends its seconds here; JOB_CPU reports the sum.
+    try:
+        import tempfile
+        _fd, _nvenc_wait_log = tempfile.mkstemp(prefix="nvenc-wait-")
+        os.close(_fd)
+        os.environ["NVENC_WAIT_LOG"] = _nvenc_wait_log
+    except OSError:
+        _nvenc_wait_log = None
+
+    def _nvenc_waits():
+        """(seconds waited in total, encodes that waited) from the wait log."""
+        if not _nvenc_wait_log:
+            return 0, 0
+        total = n = 0
+        try:
+            with open(_nvenc_wait_log) as f:
+                for line in f:
+                    try:
+                        total += int(line.strip())
+                        n += 1
+                    except ValueError:
+                        pass
+            os.remove(_nvenc_wait_log)
+        except OSError:
+            pass
+        return total, n
 
     def _report_job_cpu():
         """CPU time of the whole job (this process + every ffmpeg it waited
@@ -2521,10 +2587,19 @@ if __name__ == '__main__':
         kids = resource.getrusage(resource.RUSAGE_CHILDREN)
         py_s = own.ru_utime + own.ru_stime
         children_s = kids.ru_utime + kids.ru_stime
+        # Where Parakeet ran (None: this job did not load it). A "cpu" here on
+        # a GPU host means the image shipped onnxruntime without CUDA.
+        asr = sys.modules.get("transcribe_backends")
+        nvenc_wait_s, nvenc_waits = _nvenc_waits()
         print("JOB_CPU " + json.dumps({
             "wall_s": round(time.time() - script_start_time, 1),
             "cpu_s": round(py_s + children_s, 1), "py_s": round(py_s, 1),
             "children_s": round(children_s, 1), "gpu_decode": dict(gpu_decode.STATS),
+            "asr_device": getattr(asr, "PARAKEET_DEVICE", None),
+            # Time spent waiting for the host-wide slots (ASR_HOST_SLOTS,
+            # JOB_NVENC_SLOTS), to size them from data.
+            "asr_wait_s": round(float((getattr(asr, "ASR_WAIT", None) or {}).get("s", 0.0)), 1),
+            "nvenc_wait_s": nvenc_wait_s, "nvenc_waits": nvenc_waits,
         }), flush=True)
 
     import atexit
@@ -2540,7 +2615,7 @@ if __name__ == '__main__':
     # without TWITCH_CLIENT_ID). A URL call, so it runs before the download and
     # the early pick below gets it too.
     viewer_clips = []
-    if args.url and not args.skip_analysis:
+    if args.url and not args.skip_analysis and not args.prepare_only:
         viewer_clips = twitch_signals.viewer_clips_for_job(args.url, 0)
 
     # 1. Get Input Video
@@ -2594,6 +2669,7 @@ if __name__ == '__main__':
                              daemon=True).start()
 
         use_early = (not args.skip_analysis and not args.transcript
+                     and not args.prepare_only
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
@@ -2638,6 +2714,13 @@ if __name__ == '__main__':
         # The cut rewrites the file in place: a new size/mtime means it happened.
         if _stamp(input_video) != _before and globals().get("early") is not None:
             early["invalid"] = True  # its words cover the part that was cut off
+
+    if args.prepare_only:
+        # The source is on disk as every later stage must see it (downloaded,
+        # cut to what was reserved). A remote worker takes it from here
+        # (remote_worker.py); the marker is consumed by app.py.
+        print(f"SOURCE_READY {input_video}", flush=True)
+        sys.exit(0)
 
     # Layout choice is per SOURCE video, not per clip: one upload and one call
     # instead of one per clip, and the answer is a property of the material

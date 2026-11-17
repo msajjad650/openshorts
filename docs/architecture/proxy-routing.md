@@ -79,3 +79,52 @@ markers), not a generic connectivity endpoint: YouTube can refuse the static IPs
 while other hosts keep answering. When `YOUTUBE_COOKIES` is set it also checks
 the ytcfg `LOGGED_IN` marker and alerts on the first probe that says the session
 is gone (`cloud/alerts.py`).
+
+## The account's request budget (`yt_account.py`)
+
+Every probe and every download that sends `YOUTUBE_COOKIES` spends the same
+account's budget, and YouTube limits a busy account ("Your account has been
+rate-limited by YouTube for up to an hour"). While it is limited every request
+with the cookies fails on every route and counts against it again, and the
+anonymous attempts are bot-checked on non-residential IPs, so downloads failed
+outright.
+
+- **Paced.** `yt_account.request()` wraps each authenticated extraction (the
+  metering probe, the quality probe, the download): at most `YT_ACCOUNT_SLOTS`
+  (2) at a time on the host, started `YT_ACCOUNT_MIN_INTERVAL` (2 s) apart.
+  State is files in `output/`, shared by job processes and both containers of
+  a deploy. Fail-open: a slot that never frees is skipped after
+  `YT_ACCOUNT_MAX_WAIT`.
+- **Per video.** After two "rate-limited" answers
+  (`YT_ACCOUNT_ANSWERS_PER_VIDEO`) a probe or a download stops sending the
+  cookies for that video: the remaining routes would get the same answer, and
+  each one counts against the account. Not after one: the limit is often on a
+  single exit IP and the next static route gets the video. The anonymous
+  attempts still run.
+- **Cooldown.** YouTube limits by degrees: stray "rate-limited" answers among
+  requests that work are routine (hours of them on 12-nov-2026 with every
+  download succeeding). `YT_ACCOUNT_STRIKES` (6) in a row within
+  `YT_ACCOUNT_STRIKE_WINDOW` (180 s), with no authenticated success in
+  between, start `YT_ACCOUNT_COOLDOWN_SECONDS` during which nobody sends the
+  cookies at all. **Off by default (0)**: it only helps where a download can
+  succeed without the account, and in production the anonymous attempts are
+  bot-checked on every IP, so a cooldown stopped every download (12-nov-2026:
+  a half-limited account went to one success in a hundred). Turn it on only
+  with a route that works anonymously.
+- **Several accounts.** `YOUTUBE_COOKIES_2` .. `YOUTUBE_COOKIES_9` add
+  accounts next to `YOUTUBE_COOKIES`. Each video takes the next one in turn
+  (`yt_account.Session`, one private cookie file per probe or download), and
+  every account has its own slots and pacing. When YouTube answers
+  "rate-limited" the video moves to another account that is not resting
+  before it counts the answer against `YT_ACCOUNT_ANSWERS_PER_VIDEO`. An
+  account with `YT_ACCOUNT_REST_STRIKES` (3) such answers in a row rests
+  `YT_ACCOUNT_REST_SECONDS` (900) while the others carry the load; with every
+  account resting, the one closest to waking is used, never none. The session
+  watcher (`cloud/alerts.py`) only checks the first account.
+- **One probe per submission.** The quality gate reuses what the metering
+  probe just learned (`metering.probe_facts`) instead of asking again.
+- **Wait, not fail.** A download that failed only because of the limit prints
+  `YT_ACCOUNT_LIMITED`; `app._schedule_auto_retry` puts the job back in line
+  for when the cooldown ends, up to `YT_LIMIT_RETRIES` (3) times, on a counter
+  of its own. The user sees "YouTube is limiting downloads right now".
+

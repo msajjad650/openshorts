@@ -18,6 +18,9 @@ _ADDITIVE_COLUMNS = (
     "marketing_opt_out BOOLEAN NOT NULL DEFAULT false",
     # Nullable, no default: a catalog-only change, no table rewrite.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_plan_denied VARCHAR(32)",
+    # Account ban set by the support back-office (cloud/support_ops.py).
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ",
     # The per-network first-video check joins first_video_grants on job_id.
     "CREATE INDEX IF NOT EXISTS ix_usage_job_id ON usage_ledger (job_id)",
     # cancellation_feedback shipped without it; rows before it are all cancels.
@@ -28,6 +31,26 @@ _ADDITIVE_COLUMNS = (
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS hold_from TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS hold_until TIMESTAMPTZ",
 )
+
+
+def _pool_options(url: str) -> dict:
+    """Postgres pool sizing. SQLAlchemy's default (5 + 10 overflow, 30 s wait)
+    ran full on 16-nov with a busy host, and each request then waited 30 s for
+    a connection before answering 500. A bigger pool and a short wait: even
+    three instances overlapping in quick deploys (30 each) fit in Postgres' 100.
+    Env: DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_TIMEOUT."""
+    if not url.startswith("postgresql"):
+        return {}
+    import os
+
+    def _env(name, default):
+        try:
+            return max(0, int(os.environ.get(name, default)))
+        except ValueError:
+            return default
+    return {"pool_size": _env("DB_POOL_SIZE", 15),
+            "max_overflow": _env("DB_MAX_OVERFLOW", 15),
+            "pool_timeout": _env("DB_POOL_TIMEOUT", 10)}
 
 
 async def init_engine():
@@ -42,7 +65,8 @@ async def init_engine():
     # Import models so their tables register on Base.metadata before create_all.
     from . import models  # noqa: F401
 
-    _engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    _engine = create_async_engine(settings.database_url, pool_pre_ping=True,
+                                  **_pool_options(settings.database_url))
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
 
     async with _engine.begin() as conn:

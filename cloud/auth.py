@@ -20,7 +20,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import select, func
 
 from .config import settings
-from . import config, database, metering, email_policy, scopes
+from . import config, database, metering, email_policy, scopes, evidence
 from .models import User, MagicLinkToken, UploadPostProfile, SignupAttribution, LoginCode
 
 router = APIRouter()
@@ -80,9 +80,20 @@ class CurrentUser:
         self.upload_post_profile = upload_post_profile
 
 
+SUSPENDED_DETAIL = "This account is suspended. Contact info@openshorts.app."
+
+
+def is_banned(user) -> bool:
+    """True for an account banned by the support back-office. getattr: test
+    doubles and rows loaded before the column existed."""
+    return bool(user is not None and getattr(user, "ban_reason", None))
+
+
 async def _load_current_user(session, user_id) -> Optional["CurrentUser"]:
     user = await session.get(User, user_id)
-    if user is None:
+    if user is None or is_banned(user):
+        # A banned account authenticates as nobody: dashboard, API keys,
+        # OAuth tokens and Autopilot alike.
         return None
     sub = await metering._active_subscription(session, user_id)
     topups = await metering._topups_fifo(session, user_id)
@@ -131,7 +142,8 @@ async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
                 "call this endpoint. Use the MCP tools, or create an API key in the "
                 "dashboard for full API access."))
         async with database.session() as session:
-            return await _load_current_user(session, user_id)
+            return await _refuse_banned(session, user_id,
+                                        await _load_current_user(session, user_id))
 
     if not token:
         return None
@@ -144,7 +156,17 @@ async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
     except Exception:
         return None
     async with database.session() as session:
-        return await _load_current_user(session, user_id)
+        return await _refuse_banned(session, user_id,
+                                    await _load_current_user(session, user_id))
+
+
+async def _refuse_banned(session, user_id, current):
+    """Turn "nobody" into a 403 when the reason is a ban, so the client says
+    so instead of asking a signed-in user to sign in again. The row is already
+    in the session's identity map: no second query."""
+    if current is None and is_banned(await session.get(User, user_id)):
+        raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
+    return current
 
 
 async def get_current_user_required(request: Request) -> CurrentUser:
@@ -292,8 +314,20 @@ async def purge_stale_magic_tokens():
                 delete(LoginCode).where(LoginCode.expires_at < _now() - timedelta(days=1)))
 
 
+async def lock_signup_email(session, email: str) -> None:
+    """Serialize sign-ins that may create the user for this email.
+
+    A brand-new address has no row to lock, so two near-simultaneous sign-ins
+    (a double-clicked Google consent, a reload of the callback, a magic link
+    opened next to a Google login) both saw "no user" and both INSERTed; the
+    loser hit users_email_key and answered 500. The transaction-scoped advisory
+    lock makes the second one wait, then find the first one's row.
+    """
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(email, 0))))
+
+
 @router.post("/api/auth/magic-link/verify")
-async def verify_magic_link(payload: MagicVerifyRequest):
+async def verify_magic_link(payload: MagicVerifyRequest, request: Request = None):
     token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
     async with database.session() as session:
         async with session.begin():
@@ -306,6 +340,7 @@ async def verify_magic_link(payload: MagicVerifyRequest):
             row.used_at = _now()
             email = row.email.lower()
 
+            await lock_signup_email(session, email)
             user = (await session.execute(
                 select(User).where(User.email == email)
             )).scalar_one_or_none()
@@ -316,11 +351,15 @@ async def verify_magic_link(payload: MagicVerifyRequest):
                 session.add(user)
                 await session.flush()
             else:
+                if is_banned(user):
+                    raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
                 user.last_login_at = _now()
             user_id, user_email = user.id, user.email
 
         token = issue_jwt(user_id, user_email)
         cu = await _load_current_user(session, user_id)
+    evidence.record_event(user_id=user_id, email=user_email, kind="login",
+                          method="magic_link", request=request)
     return {"token": token, "user": {"id": str(user_id), "email": user_email, "entitled": cu.entitled}}
 
 
@@ -376,6 +415,8 @@ async def exchange_login_code(payload: LoginExchangeRequest):
             user = await session.get(User, row.user_id)
             if user is None:
                 raise bad
+            if is_banned(user):
+                raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
             user_id, user_email = user.id, user.email
         token = issue_jwt(user_id, user_email)
         cu = await _load_current_user(session, user_id)
@@ -418,7 +459,7 @@ async def login_method(payload: LoginMethodRequest):
 
 
 @router.post("/api/auth/review-login")
-async def review_login(payload: ReviewLoginRequest):
+async def review_login(payload: ReviewLoginRequest, request: Request = None):
     """Password sign-in for the single account named by REVIEW_LOGIN_EMAIL.
 
     Directory reviewers test the OAuth connection from their own browser and
@@ -437,10 +478,14 @@ async def review_login(payload: ReviewLoginRequest):
             )).scalar_one_or_none()
             if user is None:
                 raise HTTPException(status_code=401, detail="Wrong email or password.")
+            if is_banned(user):
+                raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
             user.last_login_at = _now()
             user_id, user_email = user.id, user.email
         token = issue_jwt(user_id, user_email)
         cu = await _load_current_user(session, user_id)
+    evidence.record_event(user_id=user_id, email=user_email, kind="login",
+                          method="password", request=request)
     return {"token": token, "user": {"id": str(user_id), "email": user_email, "entitled": cu.entitled}}
 
 

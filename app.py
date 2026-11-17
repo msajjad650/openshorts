@@ -15,6 +15,7 @@ import zipfile
 import math
 import itertools
 import functools
+import heapq
 import asyncio
 import signal
 import socket
@@ -25,7 +26,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
@@ -33,6 +34,8 @@ import recut
 import layout_ranges
 import watermarked
 import media_auth
+import remote_worker
+import yt_account
 from jsonfile import write_json_atomic
 
 load_dotenv()
@@ -90,6 +93,7 @@ CHILD_ENV_DENYLIST = frozenset({
     "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "OPENPANEL_CLIENT_SECRET", "ELEVENLABS_API_KEY",
+    "REMOTE_WORKER_TOKEN",
 })
 
 
@@ -161,6 +165,14 @@ else:
     async def get_current_user_optional(request: Request):
         # No-op dependency in self-host mode: every request is anonymous / BYOK.
         return None
+
+# The free queue's saturation mode (lanes, newest first, brake). Plain policy
+# with no dependencies, importable with billing off; inert unless configured.
+from cloud import queue_mode as _queue_mode
+
+
+def _saturation_on() -> bool:
+    return BILLING_ENABLED and _queue_mode.enabled()
 
 
 async def _user_from_request(request: Request):
@@ -632,6 +644,10 @@ async def _reserve_after_job_limit(request, user, url, input_path, job_id, max_m
             "quota_exceeded", "The user is out of OpenShorts processing minutes for this period.",
             minutes_required=1, minutes_remaining=balance["remaining"], partial_minutes=0)
 
+    # Free queue lane, then the brake: before the probe, the reservation and
+    # the first-video grant, so a refused submission spends none of them.
+    priority = _assign_queue_lane(request, user, balance, priority)
+
     # The dashboard's cost line probed this URL a moment ago (/api/process/
     # estimate): reuse it rather than fetching the same metadata twice.
     cached = _cached_probe(user.id, url) if url else None
@@ -652,9 +668,7 @@ async def _reserve_after_job_limit(request, user, url, input_path, job_id, max_m
         if cached is not None:
             minutes = cached
         elif url:
-            minutes = await loop.run_in_executor(
-                None, functools.partial(_metering.probe_url_minutes, url,
-                                        allow_paid=paid_allowed))
+            minutes = await _metering.run_probe(url, allow_paid=paid_allowed)
         else:
             minutes = await loop.run_in_executor(None, _metering.probe_file_minutes, input_path)
     except Exception as e:
@@ -750,6 +764,55 @@ async def _reserve_after_job_limit(request, user, url, input_path, job_id, max_m
     return user.id, priority, reservation_id, user.plan, partial
 
 
+FREE_QUEUE_FULL_MESSAGE = ("The free queue is full right now. Come back later, "
+                           "or skip the line with a plan.")
+
+
+def free_queue_full_error() -> HTTPException:
+    """The brake's refusal: the 402 pattern (``upgrade_url`` in the body and
+    in the message) so the dashboard opens its plan wall and an agent can hand
+    the link over. It names no country or region."""
+    return payment_required("free_queue_full", FREE_QUEUE_FULL_MESSAGE, retry_later=True)
+
+
+def _assign_queue_lane(request, user, balance, priority) -> int:
+    """The lane of a new managed job (``request.state.queue_lane``) and its
+    queue priority. Slow only for a free-plan account with no top-up credit
+    whose request comes from a slow-lane country (its address in the local
+    country database, ``cloud/geoip.py``). While the slow lane's brake is on, such
+    a submission is refused here (``free_queue_full``).
+
+    With the mode on, a free-plan account with top-up credit has paid: its
+    job queues with the paid plans (``request.state.queue_topup``, kept in the
+    manifest), so neither the newest-first order nor the expiry of starved
+    free jobs, which only exist below the paid priorities, can reach it."""
+    request.state.queue_lane = _queue_mode.NORMAL
+    request.state.queue_topup = False
+    if not _saturation_on() or user.plan != "free":
+        return priority
+    if float(balance.get("topup_remaining") or 0) > 0:
+        request.state.queue_topup = True
+        return min(priority, _queue_mode.PAID_PRIORITY)
+    country = _queue_mode.request_country(
+        request.headers, request.client.host if request.client else None)
+    lane = _queue_mode.lane_for(user.plan, country)
+    if lane != _queue_mode.SLOW:
+        return priority
+    if _queue_mode.brake_active():
+        _queue_mode.note_rejected()
+        # Who was refused, by account prefix only (no address, no country):
+        # enough to audit refusals against plans and top-ups.
+        print(f"[queue-full] refused {str(user.id).replace('-', '')[:8]}")
+        try:
+            from cloud import analytics as _an
+            _an.track("FreeQueueFull", user_id=user.id, via_api=request_uses_api_key(request))
+        except Exception:
+            pass
+        raise free_queue_full_error()
+    request.state.queue_lane = lane
+    return _queue_mode.priority_for(priority, lane)
+
+
 async def reserve_managed_action(request, minutes, job_id, job_type):
     """Reserve quota for a synchronous managed action (e.g. thumbnail image gen).
 
@@ -818,19 +881,41 @@ async def _assert_job_owner(request, record):
     owner = record.get("user_id") if isinstance(record, dict) else None
     if owner is None:
         return
-    user = await _user_from_request(request)
     # Compare as strings: live jobs store a uuid.UUID, but jobs recovered from
     # the .owner sidecar store its string form — UUID != str is always True.
-    if user is None or str(user.id) != str(owner):
+    if await _owner_id_from_request(request) != str(owner):
         raise HTTPException(status_code=404, detail="Not found")
 
+
+# Who the caller of a GET is, remembered per credential for the owner check
+# alone, with a cap on how many of those lookups hold a pool connection at once
+# (cloud/owner_cache.py). A ban, a revoked key or an erased account forgets it.
+from cloud import owner_cache as _owner_cache
+
+
+async def _owner_id_from_request(request):
+    credential = (request.headers.get("Authorization", "")
+                  + "\n" + request.headers.get("X-API-Key", ""))
+    if request.method != "GET" or not credential.strip():
+        user = await _user_from_request(request)
+        return str(user.id) if user is not None else None
+    try:
+        return await _owner_cache.owner_id(credential,
+                                           lambda: _user_from_request(request))
+    except _owner_cache.Busy:
+        raise HTTPException(status_code=503, detail="Busy, retry shortly.",
+                            headers={"Retry-After": "3"})
+
 # Application State
-# PriorityQueue holds (priority, seq, job_id). Lower priority dispatches first:
-# pro=0, starter/creator=1, BYOK/anonymous/self-host=2. The seq counter keeps
-# FIFO order within a priority and makes the tuples always comparable. With
+# PriorityQueue holds (priority, key, job_id). Lower priority dispatches first:
+# pro=0, starter/creator=1, free/BYOK/anonymous/self-host=2, and the free slow
+# lane 3 (cloud/queue_mode.py, off unless configured). The key orders a
+# priority: the job's submission time (``submitted_at``, which travels in the
+# resume manifest, so a job enqueued again after a deploy keeps its place),
+# or minus that time in a free lane that serves its newest job first. With
 # BILLING disabled every job enqueues at priority 2 → plain FIFO as before.
 job_queue = asyncio.PriorityQueue()
-_job_seq = itertools.count()
+_job_seq = itertools.count()  # kept for callers that reset it; keys are times now
 jobs: Dict[str, Dict] = {}
 thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
@@ -868,21 +953,62 @@ def queue_estimate(ahead: int, running: int, slots: int, typical_seconds: float)
     return int(max(30, round(typical_seconds * (0.5 + rounds - 1 / slots))))
 
 
+# Every change this module makes to the heap bumps this, so /api/status (polled
+# every 2 s by each open tab) ranks a queue of thousands once per change, not
+# once per poll.
+_queue_version = 0
+_rank_cache = {"key": None, "rank": {}}
+
+
+def _queue_changed():
+    global _queue_version
+    _queue_version += 1
+
+
+def _queue_ranks() -> dict:
+    """``{job_id: (index, priority)}`` of the queued entries in dispatch order.
+    Cached on the heap's identity, version and size, and for one second at
+    most (a status flip nobody announced)."""
+    heap = job_queue._queue
+    key = (id(job_queue), _queue_version, len(heap), int(time.monotonic()))
+    if _rank_cache["key"] != key:
+        rank, i = {}, 0
+        for prio, _k, jid in sorted(heap):
+            if jid in rank or (jobs.get(jid) or {}).get('status') != 'queued':
+                continue
+            rank[jid] = (i, prio)
+            i += 1
+        _rank_cache.update(key=key, rank=rank)
+    return _rank_cache["rank"]
+
+
+def _overtakable(priority) -> bool:
+    """Whether jobs that arrive later can still go in front of this one beyond
+    paid plans: a free lane serving its newest first, or the slow lane (the
+    normal lane goes before it). Its ETA is then a minimum, not an estimate."""
+    if not _saturation_on() or priority is None or priority < _queue_mode.FREE_PRIORITY:
+        return False
+    lane = _queue_mode.lane_of_priority(priority)
+    return lane == _queue_mode.SLOW or _queue_mode.recent_first(lane)
+
+
 def queue_snapshot(job_id):
-    """``{position, ahead, eta_seconds}`` for a queued job, else None."""
+    """``{position, ahead, eta_seconds, eta_is_minimum}`` for a queued job,
+    else None. Position is in the real dispatch order (lanes and newest-first
+    included); ``eta_is_minimum`` says later arrivals can still pass it."""
     job = jobs.get(job_id) or {}
     if job.get('status') != 'queued':
         return None
     try:
-        entries = sorted(job_queue._queue)  # (priority, seq, job_id)
+        ranks = _queue_ranks()
     except Exception:
-        entries = []
-    queued_ids = [e[2] for e in entries
-                  if (jobs.get(e[2]) or {}).get('status') == 'queued']
+        ranks = {}
+    prio = None
     if job_id in _admitting:
         ahead = len([j for j in _admitting if j != job_id])
-    elif job_id in queued_ids:
-        ahead = len(_admitting) + queued_ids.index(job_id)
+    elif job_id in ranks:
+        idx, prio = ranks[job_id]
+        ahead = len(_admitting) + idx
     else:
         return None
     sample = sorted(_recent_job_seconds)
@@ -891,11 +1017,409 @@ def queue_snapshot(job_id):
         "position": ahead + 1,
         "ahead": ahead,
         "eta_seconds": queue_estimate(ahead, len(_running_jobs), MAX_CONCURRENT_JOBS, typical),
+        "eta_is_minimum": _overtakable(prio),
     }
 
 
+_last_arrival = 0.0
+
+
+def _arrival_now() -> float:
+    """Now, strictly after the last arrival handed out (equal keys would fall
+    back to comparing job ids)."""
+    global _last_arrival
+    _last_arrival = max(time.time(), _last_arrival + 1e-6)
+    return _last_arrival
+
+
+def _job_arrival(job_id) -> float:
+    """When the job was submitted (stamped on its record the first time)."""
+    job = jobs.get(job_id)
+    if job is None:
+        return _arrival_now()
+    t = job.get('submitted_at')
+    if t is None:
+        t = job['submitted_at'] = _arrival_now()
+    return float(t)
+
+
+def _job_last_run(job) -> float:
+    """When the job last started running (here, or before a resume), or 0."""
+    return float((job or {}).get('last_run') or (job or {}).get('run_started') or 0)
+
+
+def _entry_key(priority, job_id, old_key=None) -> float:
+    """Heap key of ``job_id`` at ``priority``. FIFO: its submission time.
+    Newest first: minus the later of its submission and its last run, so a
+    video cut by a drain or auto-retried counts as recent there and is not
+    left at the back behind every newer arrival. Without a record the old
+    key's time stands (``abs``: keys are signed times)."""
+    job = jobs.get(job_id)
+    if job is not None:
+        sub, last = _job_arrival(job_id), _job_last_run(job)
+    elif old_key is not None:
+        sub = last = abs(float(old_key))
+    else:
+        sub = last = _arrival_now()
+    if (_saturation_on() and priority >= _queue_mode.FREE_PRIORITY
+            and _queue_mode.recent_first(_queue_mode.lane_of_priority(priority))):
+        return -max(sub, last)
+    return sub
+
+
 def _enqueue_job(job_id: str, priority: int = 2):
-    job_queue.put_nowait((priority, next(_job_seq), job_id))
+    # A slow-lane job folds into the normal lane while the slow lane is off.
+    priority = _queue_mode.effective_priority(priority)
+    job_queue.put_nowait((priority, _entry_key(priority, job_id), job_id))
+    _queue_changed()
+
+
+def _fold_slow_lane() -> int:
+    """With the slow lane switched off (kill switch, empty country list), the
+    jobs already in it join the normal lane by their submission time, live.
+    Loop thread only; their manifests keep their lane, and enqueueing folds
+    them again (``_enqueue_job``). Returns how many moved."""
+    if _queue_mode.slow_lane_on():
+        return 0
+    heap = job_queue._queue
+    moved = 0
+    for i, (prio, key, jid) in enumerate(heap):
+        if prio >= _queue_mode.SLOW_PRIORITY:
+            heap[i] = (_queue_mode.FREE_PRIORITY,
+                       _entry_key(_queue_mode.FREE_PRIORITY, jid, key), jid)
+            moved += 1
+    if moved:
+        heapq.heapify(heap)
+        _queue_changed()
+        print(f"🚦 Slow lane off: {moved} job(s) moved to the normal free lane.")
+    return moved
+
+
+# --- The backlog follows the slow lane -----------------------------------------
+# A lane is decided at submit, from the request. A job enqueued again from its
+# manifest was submitted to an earlier instance, maybe before the slow lane
+# existed or under another country list: it sits in the normal lane whatever
+# its owner's country, and takes the spare capacity that lane gets from the
+# people the list does not cover. Once per job and per boot, such a job is
+# checked against the list with the country of its owner's last recorded
+# request (``cloud/evidence.py``); unknown = it stays where it is.
+_BOOTED_AT = time.time()
+_lane_rechecked: set = set()
+
+
+async def _owner_countries(owner_ids) -> dict:
+    """``{owner_id: country code or ""}`` from each owner's last recorded
+    address, looked up in the local country database (one batch, no call)."""
+    from cloud import evidence as _evidence
+    ips = await _evidence.last_ips(owner_ids)
+    return {u: _queue_mode.request_country({}, ip) for u, ip in ips.items()}
+
+
+def _rewrite_manifest_lanes(job_ids, running: set) -> set:
+    """Worker thread: the manifests of ``job_ids`` that nobody runs move to
+    the slow lane, so the next instance enqueues them there."""
+    rewritten = set()
+    for name in job_ids:
+        m = _read_manifest(name)
+        if (not m or name in running or _manifest_busy_elsewhere(m)
+                or m.get("stage") == "delivering"):
+            continue
+        try:
+            if int(m.get("priority", _queue_mode.FREE_PRIORITY)) != _queue_mode.FREE_PRIORITY:
+                continue  # raised by a payment meanwhile: the payment wins
+        except (TypeError, ValueError):
+            continue
+        if name in _running_jobs or name in _delivering_jobs:
+            continue
+        m["priority"] = _queue_mode.SLOW_PRIORITY
+        m["lane"] = _queue_mode.SLOW
+        try:
+            write_json_atomic(_manifest_path(name), m)
+            rewritten.add(name)
+        except Exception as e:
+            print(f"⚠️ Could not move the manifest of {name} to the slow lane: {e}")
+    return rewritten
+
+
+async def _move_backlog_to_slow_lane() -> int:
+    """Queued free jobs of the normal lane that this instance did not take at
+    submit go to the slow lane when their owner's country is on the list.
+    Paid and top-up jobs sit above the free priority and are never looked at;
+    a job only ever moves down here once, and paying moves it up as usual.
+    Returns how many moved."""
+    if not _saturation_on() or not _queue_mode.slow_lane_on() or _draining:
+        return 0
+    heap = job_queue._queue
+    _lane_rechecked.intersection_update({e[2] for e in heap})
+    cand = {}
+    for prio, _key, jid in heap:
+        if prio != _queue_mode.FREE_PRIORITY or jid in _lane_rechecked:
+            continue
+        job = jobs.get(jid)
+        if not job or job.get('status') != 'queued' or job.get('user_id') is None:
+            continue
+        if float(job.get('submitted_at') or 0) >= _BOOTED_AT:
+            continue  # submitted here: its lane was decided from its request
+        cand[jid] = str(job['user_id'])
+    if not cand:
+        return 0
+    try:
+        countries = await _owner_countries(set(cand.values()))
+    except Exception as e:
+        print(f"⚠️ Country lookup for the queued backlog failed, lanes kept: {type(e).__name__}")
+        return 0
+    _lane_rechecked.update(cand)
+    slow = {jid for jid, owner in cand.items()
+            if _queue_mode.lane_for("free", countries.get(owner)) == _queue_mode.SLOW}
+    moved = []
+    for i, (prio, key, jid) in enumerate(heap):
+        if (jid in slow and prio == _queue_mode.FREE_PRIORITY
+                and (jobs.get(jid) or {}).get('status') == 'queued'):
+            heap[i] = (_queue_mode.SLOW_PRIORITY,
+                       _entry_key(_queue_mode.SLOW_PRIORITY, jid, key), jid)
+            jobs[jid]['lane'] = _queue_mode.SLOW
+            moved.append(jid)
+    if not moved:
+        return 0
+    heapq.heapify(heap)
+    _queue_changed()
+    await asyncio.to_thread(_rewrite_manifest_lanes, moved, set(_running_jobs))
+    print(f"🚦 Moved {len(moved)} waiting free job(s) of the backlog to the slow lane.")
+    return len(moved)
+
+
+def _rekey_lanes(lanes=None):
+    """Re-sort the free lanes after their order changed (newest first on or
+    off): each entry's key is its arrival time with the sign of its lane's
+    mode. The queue's size and waiters do not change. Loop thread only."""
+    heap = job_queue._queue
+    changed = False
+    for i, (prio, key, jid) in enumerate(heap):
+        if prio < _queue_mode.FREE_PRIORITY:
+            continue
+        if lanes is not None and _queue_mode.lane_of_priority(prio) not in lanes:
+            continue
+        new = _entry_key(prio, jid, key)
+        if new != key:
+            heap[i] = (prio, new, jid)
+            changed = True
+    if changed:
+        heapq.heapify(heap)
+        _queue_changed()
+    return changed
+
+
+_queue_mode.register_on_change(_rekey_lanes)
+
+
+# --- Paying moves a waiting video up (billing webhook -> here) ---------------
+# The priority is decided at enqueue, so a free user who paid while their video
+# waited kept waiting behind every paid job. ``reprioritize_user_jobs`` re-keys
+# their queued entries and their resume manifests; running jobs are left alone.
+#
+# Whatever reads or rewrites manifests here runs in a worker thread
+# (``asyncio.to_thread``): with thousands of job dirs that is a lot of open() +
+# json.load, and the API and its health check share this event loop. The heap
+# itself is only ever touched on the loop thread.
+def _raise_queued(new_priority_for) -> list:
+    """Re-key queued entries in place. ``new_priority_for(job_id, priority)``
+    returns the priority the entry should have, or None; an entry only ever
+    moves up. Each entry keeps its arrival time, so inside its new priority a
+    job keeps its arrival order (keyed the way that priority orders: a job
+    leaving the slow lane while the normal one serves newest first takes that
+    order). The queue's size and waiters do not change, so editing the heap
+    and re-heapifying is all it takes. Returns the job ids moved.
+    Loop thread only."""
+    heap = job_queue._queue
+    moved = []
+    for i, (prio, key, jid) in enumerate(heap):
+        new = new_priority_for(jid, prio)
+        if new is not None and int(new) < prio:
+            heap[i] = (int(new), _entry_key(int(new), jid, key), jid)
+            moved.append(jid)
+    if moved:
+        heapq.heapify(heap)
+        _queue_changed()
+    return moved
+
+
+def _manifest_names() -> list:
+    """Job dirs holding a resume manifest. OUTPUT_DIR also has loose files (the
+    instance marker, the queue watch state and lock, lock files): skip them
+    instead of reading ``<file>/.resume.json``."""
+    try:
+        entries = os.listdir(OUTPUT_DIR)
+    except FileNotFoundError:
+        return []
+    return [n for n in entries
+            if not n.startswith(".") and os.path.isfile(_manifest_path(n))]
+
+
+# Changes whenever some instance raises manifest priorities, so the other one
+# reads the manifests of its queue only then (``_follow_manifest_priorities``).
+_PRIORITY_GEN_FILE = ".priority_gen"
+_UNSEEN = object()
+_seen_priority_gen = _UNSEEN
+
+
+def _priority_generation():
+    try:
+        with open(os.path.join(OUTPUT_DIR, _PRIORITY_GEN_FILE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _bump_priority_generation():
+    try:
+        write_json_atomic(os.path.join(OUTPUT_DIR, _PRIORITY_GEN_FILE), uuid.uuid4().hex)
+    except Exception as e:
+        print(f"⚠️ Could not stamp the priority generation: {e}")
+
+
+def _rewrite_manifest_priorities(want: dict, running: set, raised_at: float) -> set:
+    """Worker thread: raise the manifests of ``want``'s owners that nobody
+    runs (``running`` is a copy of ``_running_jobs``). Returns the job ids."""
+    rewritten = set()
+    for name in _manifest_names():
+        m = _read_manifest(name)
+        uid = str((m or {}).get("user_id"))
+        if (not m or uid not in want or name in running
+                or _manifest_busy_elsewhere(m) or m.get("stage") == "delivering"):
+            continue  # a delivering job is past the queue; its stamps win
+        if int(m.get("priority", 2)) <= want[uid]:
+            continue
+        if name in _running_jobs or name in _delivering_jobs:
+            continue  # dispatched since the copy was taken: its heartbeat wins
+        m["priority"] = want[uid]
+        m["raised_at"] = raised_at
+        try:
+            write_json_atomic(_manifest_path(name), m)
+            rewritten.add(name)
+        except Exception as e:
+            print(f"⚠️ Could not reprioritize manifest for {name}: {e}")
+    if rewritten:
+        _bump_priority_generation()
+    return rewritten
+
+
+async def reprioritize_user_jobs(user_id, priority) -> int:
+    """Move every job of ``user_id`` that is still waiting up to ``priority``.
+
+    In this instance's queue and in every resume manifest on the shared disk
+    that nobody is running, so the job keeps the new priority when the other
+    instance of a deploy (or the next one) enqueues it from its manifest; the
+    other instance's own queue follows its manifests (``_follow_manifest_priorities``).
+    Running jobs and their manifests are not touched. Returns how many jobs moved.
+    """
+    return await _raise_users_jobs({str(user_id): int(priority)})
+
+
+async def _raise_users_jobs(priority_by_user: dict) -> int:
+    """``reprioritize_user_jobs`` for many owners at once: one pass over the
+    heap (here, on the loop) and one over the manifests (in a thread)."""
+    want = {str(u): int(p) for u, p in priority_by_user.items()}
+    if not want:
+        return 0
+    owner = {jid: str(j.get('user_id')) for jid, j in jobs.items()
+             if str(j.get('user_id')) in want}
+    moved = _raise_queued(lambda jid, _p: want[owner[jid]] if jid in owner else None)
+    raised_at = time.time()
+    for jid in moved:
+        job = jobs.get(jid) or {}
+        # The queue watch measures a paid wait from here, not from submission.
+        job['raised_at'] = raised_at
+        logs = job.get('logs')
+        if logs is not None:
+            logs.append("⚡ Your plan moved this video up the line.")
+    rewritten = await asyncio.to_thread(
+        _rewrite_manifest_priorities, want, set(_running_jobs), raised_at)
+    n = len(set(moved) | rewritten)
+    if n:
+        print(f"⚡ Moved {n} waiting job(s) of {len(want)} paying user(s) up the line.")
+    return n
+
+
+# Jobs enqueued again from a manifest (startup, resume scan) whose owner's plan
+# has not been looked up yet: the manifest holds the priority of the plan at
+# submit, and the owner may have paid since (while it waited, or while it ran
+# and a deploy's drain cut it).
+_owner_plan_pending: set = set()
+
+
+async def _owner_live_plans(owner_ids) -> dict:
+    """``{owner_id: plan}`` of the owners on a live paid plan (one batch)."""
+    return await _metering.live_plans(owner_ids)
+
+
+async def _raise_to_owner_plans(job_ids=None) -> int:
+    """Give each re-enqueued job the better of its manifest's priority and the
+    one its owner's plan has NOW. ``job_ids`` defaults to (and drains)
+    ``_owner_plan_pending``. One lookup for all the owners; if it fails the
+    jobs keep their manifest's priority."""
+    if job_ids is None:
+        job_ids = set(_owner_plan_pending)
+        _owner_plan_pending.difference_update(job_ids)
+    if not BILLING_ENABLED:
+        return 0
+    owners = {str(jobs[j]['user_id']) for j in job_ids
+              if (jobs.get(j) or {}).get('user_id') is not None}
+    if not owners:
+        return 0
+    try:
+        plans = await _owner_live_plans(owners)
+    except Exception as e:
+        print(f"⚠️ Plan lookup for re-enqueued jobs failed, keeping their priority: {e}")
+        return 0
+    # Paid plans only: a "free" row must never pull a slow-lane job up.
+    want = {u: _cloud_config.PLAN_PRIORITY[p] for u, p in plans.items()
+            if p in _cloud_config.PLAN_PRIORITY
+            and _cloud_config.PLAN_PRIORITY[p] < _queue_mode.FREE_PRIORITY}
+    if _saturation_on():
+        # Free-plan owners with top-up minutes queue as paid (as a submit does
+        # with the mode on): covers jobs queued before their manifests said so.
+        try:
+            topped = await _owner_topups(owners - set(want))
+        except Exception as e:
+            print(f"⚠️ Top-up lookup for re-enqueued jobs failed, keeping their priority: {e}")
+            topped = set()
+        for u in topped:
+            want[u] = min(want.get(u, _queue_mode.PAID_PRIORITY), _queue_mode.PAID_PRIORITY)
+    return await _raise_users_jobs(want)
+
+
+async def _owner_topups(owner_ids) -> set:
+    """Owners among ``owner_ids`` with top-up minutes left (one batch)."""
+    return await _metering.topup_owners(owner_ids)
+
+
+def _manifest_priorities(job_ids) -> dict:
+    """Worker thread: ``{job_id: priority}`` from the manifests of ``job_ids``."""
+    out = {}
+    for jid in job_ids:
+        m = _read_manifest(jid) or {}
+        try:
+            if "priority" in m:
+                out[jid] = int(m["priority"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+async def _follow_manifest_priorities() -> list:
+    """Raise queued entries whose manifest now says a better priority: the
+    webhook that upgraded their owner reached the other instance of a deploy,
+    which can rewrite the manifests on the shared disk but not our heap. Reads
+    the manifests only when the generation stamp changed since the last look
+    (it is read first, so a rewrite racing the read is seen next time)."""
+    global _seen_priority_gen
+    gen = await asyncio.to_thread(_priority_generation)
+    if gen == _seen_priority_gen:
+        return []
+    queued = [e[2] for e in job_queue._queue]
+    prios = await asyncio.to_thread(_manifest_priorities, queued)
+    _seen_priority_gen = gen
+    return _raise_queued(lambda jid, _p: prios.get(jid))
 
 def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
     """
@@ -1310,6 +1834,8 @@ def _recover_jobs_from_disk():
             continue
         if os.path.isfile(os.path.join(job_path, _RESUME_FILE)):
             continue  # in flight (interrupted or on the other instance): resume, not recover
+        if os.path.exists(os.path.join(job_path, _EXPIRED_MARKER)):
+            continue  # ended unrun in the queue; /api/status answers from disk
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
             continue
@@ -1348,7 +1874,8 @@ def _recover_jobs_from_disk():
 # lose it: the user's clip just stops. We persist a tiny manifest per job and,
 # on startup, re-enqueue any that were interrupted — the user sees it resume
 # instead of vanish. Bounded by MAX_RESUME_ATTEMPTS so a video that reliably
-# crashes the worker can't crashloop the service.
+# crashes the worker can't crashloop the service; only resumes of a run that
+# had started count (a queued video survives any number of deploys).
 _RESUME_FILE = ".resume.json"
 MAX_RESUME_ATTEMPTS = 2
 
@@ -1395,6 +1922,85 @@ _stopping = False                    # SIGTERM received: report not-ready so the
 _running_jobs: set = set()           # job ids with a live subprocess here
 
 
+# --- Remote CPU worker (remote_worker.py, worker.py) -------------------------
+# Off unless REMOTE_WORKER_TOKEN is set and REMOTE_WORKER_SLOTS > 0. A remote
+# job is dispatched and delivered by this instance like any other (it is in
+# ``_running_jobs``: a drain waits for it, its manifest is heartbeated), but
+# its main.py runs on the worker, so it holds none of the GPU slots.
+def _int_env(name, default):
+    try:
+        return max(0, int(os.environ.get(name, str(default)).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+REMOTE_WORKER_TOKEN = os.environ.get("REMOTE_WORKER_TOKEN", "").strip()
+REMOTE_WORKER_SLOTS = _int_env("REMOTE_WORKER_SLOTS", 0)
+# No call from the worker for this long: the job comes back to this host.
+REMOTE_LEASE_SECONDS = _int_env("REMOTE_LEASE_SECONDS", 180)
+# What one job may send back: a clip is tens of MB, a job a few hundred.
+REMOTE_MAX_FILE_MB = _int_env("REMOTE_MAX_FILE_MB", 1024)
+REMOTE_MAX_JOB_MB = _int_env("REMOTE_MAX_JOB_MB", 3072)
+# A render that takes longer than this on the worker comes back to this host.
+REMOTE_MAX_SECONDS = _int_env("REMOTE_MAX_SECONDS", 3600)
+# This many of the last remote jobs did not end well: no more claims for a
+# while (a worker that is broken, or not ours any more, must not chew through
+# the queue: every claim costs a download and delays a user's video). A
+# window, not a streak: one good job in between does not reset it.
+REMOTE_BREAKER_FAILURES = _int_env("REMOTE_BREAKER_FAILURES", 4)
+REMOTE_BREAKER_WINDOW = 10           # ...counted over the last this many
+REMOTE_BREAKER_SECONDS = _int_env("REMOTE_BREAKER_SECONDS", 1800)
+
+
+def _quiet_minutes(spec):
+    """Minutes of the hour (UTC) given as "55-5,28-32": wrap-around ranges."""
+    out = set()
+    for part in (spec or "").split(","):
+        try:
+            a, _, b = part.strip().partition("-")
+            a, b = int(a) % 60, int(b or a) % 60
+        except ValueError:
+            continue
+        m = a
+        while True:
+            out.add(m)
+            if m == b:
+                break
+            m = (m + 1) % 60
+    return out
+
+
+# No new claim in these minutes of the hour: the worker's host also carries
+# Upload-Post, whose scheduled posts fill its link at :00-:05. A claim is a
+# ~1 GB source sent over that link a minute or two later.
+REMOTE_QUIET_MINUTES = _quiet_minutes(os.environ.get("REMOTE_QUIET_MINUTES", ""))
+# Per-transfer cap on the source sent to the worker, in Mbit/s (0: none).
+REMOTE_SOURCE_MBPS = _int_env("REMOTE_SOURCE_MBPS", 0)
+_remote_jobs: set = set()            # the subset of _running_jobs run remotely
+_remote_breaker = {"recent": [], "until": 0.0}
+
+
+def _remote_enabled() -> bool:
+    return (len(REMOTE_WORKER_TOKEN) >= remote_worker.MIN_TOKEN_LENGTH
+            and REMOTE_WORKER_SLOTS > 0)
+
+
+def _remote_outcome(ok: bool):
+    """Count a finished remote job towards the breaker."""
+    recent = _remote_breaker["recent"]
+    recent.append(bool(ok))
+    del recent[:-REMOTE_BREAKER_WINDOW]
+    if REMOTE_BREAKER_FAILURES and recent.count(False) >= REMOTE_BREAKER_FAILURES:
+        _remote_breaker.update(recent=[], until=time.time() + REMOTE_BREAKER_SECONDS)
+        print(f"🛰️ {REMOTE_BREAKER_FAILURES} of the last remote jobs did not end well: "
+              f"no job goes to the remote worker for {REMOTE_BREAKER_SECONDS // 60} min.")
+
+
+def _local_running() -> int:
+    """Jobs whose main.py runs on this host: what the GPU slots count."""
+    return len(_running_jobs - _remote_jobs)
+
+
 def _manifest_path(job_id):
     return os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
 
@@ -1410,16 +2016,23 @@ def _read_manifest(job_id):
         return None
 
 
-def _touch_manifest(job_id, now=None):
-    """Stamp 'this instance is running it, as of now' into the manifest."""
+def _touch_manifest(job_id, now=None, started=False):
+    """Stamp 'this instance is running it, as of now' into the manifest.
+    ``started`` (at dispatch) also stamps ``run_started``: a heartbeat says the
+    worker is alive, not that the job is moving, so the metering sweeper's
+    hung-job cap counts from the start of the run."""
     m = _read_manifest(job_id)
     if m is None:
         return
     m["heartbeat"] = now if now is not None else time.time()
     m["instance"] = INSTANCE_ID
+    if started:
+        m["run_started"] = m["heartbeat"]
     try:
-        with open(_manifest_path(job_id), "w") as f:
-            json.dump(m, f)
+        # Atomic: the other instance reads it at any time (resume scan, GPU
+        # admission, the metering sweeper's live set), and a half-written
+        # manifest reads as no manifest at all.
+        write_json_atomic(_manifest_path(job_id), m)
     except Exception as e:
         print(f"⚠️ Could not heartbeat manifest for {job_id}: {e}")
 
@@ -1452,7 +2065,10 @@ def _jobs_busy_elsewhere(now=None) -> int:
         if not os.path.exists(path):
             continue
         m = _read_manifest(name)
-        if m and _manifest_busy_elsewhere(m, now):
+        # A job delivering elsewhere has left the card: it holds no GPU slot.
+        # Nor does one a remote worker is rendering.
+        if (m and _manifest_busy_elsewhere(m, now) and m.get("stage") != "delivering"
+                and not remote_worker.is_remote(os.path.join(OUTPUT_DIR, name))):
             busy += 1
     return busy
 
@@ -1512,12 +2128,13 @@ async def _wait_for_shared_gpu():
     logged = False
     loop = asyncio.get_event_loop()
     while waited < SHARED_GPU_MAX_WAIT:
-        elsewhere = _jobs_busy_elsewhere()
+        # Reads every manifest on the shared disk: off the loop.
+        elsewhere = await loop.run_in_executor(None, _jobs_busy_elsewhere)
         free_mb = await loop.run_in_executor(None, _gpu_free_mb)
-        if gpu_has_room(len(_running_jobs), elsewhere, free_mb):
+        if gpu_has_room(_local_running(), elsewhere, free_mb):
             return
         if not logged:
-            print(f"⏳ Holding the next job: {len(_running_jobs)} running here, "
+            print(f"⏳ Holding the next job: {_local_running()} running here, "
                   f"{elsewhere} on a draining instance, "
                   f"{free_mb if free_mb is not None else '?'} MiB GPU free "
                   f"(needs {GPU_MIN_FREE_MB}).")
@@ -1574,7 +2191,12 @@ async def _resume_scan():
         if _draining:
             continue
         try:
-            _resume_interrupted_jobs()
+            await _resume_interrupted_jobs_async()
+            _fold_slow_lane()
+            await _raise_to_owner_plans()
+            await _follow_manifest_priorities()
+            await _move_backlog_to_slow_lane()
+            await _expire_starved_jobs()
         except Exception as e:
             print(f"⚠️ Resume scan failed: {e}")
 
@@ -1587,11 +2209,14 @@ async def _drain_then_exit(previous_handler, timeout=None, proxy_grace=None,
     proxy_grace = PROXY_DRAIN_SECONDS if proxy_grace is None else proxy_grace
     hard_exit_after = HARD_EXIT_SECONDS if hard_exit_after is None else hard_exit_after
     deadline = time.time() + timeout
-    while _running_jobs and time.time() < deadline:
+    # A delivery (R2 upload, webhook, emails) runs after its job left the GPU
+    # slot: wait for those too, so a deploy cuts none of them.
+    while (_running_jobs or _delivering_jobs) and time.time() < deadline:
         await asyncio.sleep(1)
-    if _running_jobs:
+    if _running_jobs or _delivering_jobs:
         print(f"⏱️ Drain timeout after {timeout}s with {len(_running_jobs)} job(s) still "
-              f"running — they will resume on the next instance.")
+              f"running and {len(_delivering_jobs)} delivering — they will resume on "
+              f"the next instance.")
     else:
         print("✅ Drained: no running jobs.")
     if proxy_grace > 0:
@@ -1635,11 +2260,11 @@ def _install_drain_signal_handler():
 def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
                            webhook_url=None, webhook_secret=None, base_url=None,
                            partial=None, source_cap_minutes=None, skip_statics=False,
-                           via_api_key=False):
+                           via_api_key=False, lane=None, submitted_at=None, topup=False):
     try:
         path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
-        with open(path, "w") as f:
-            json.dump({
+        # Atomic like every manifest write: the other instance reads them.
+        write_json_atomic(path, {
                 "cmd": cmd, "priority": priority,
                 "user_id": None if user_id is None else str(user_id),
                 "reservation_id": reservation_id,
@@ -1660,7 +2285,12 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 # The probe's "statics bot-checked for this video" verdict.
                 "skip_statics": bool(skip_statics),
                 "via_api_key": bool(via_api_key),
-            }, f)
+                # Free queue lane and submission time: a job enqueued again
+                # (deploy, resume scan) keeps its lane and its place in it.
+                "lane": lane or _queue_mode.NORMAL,
+                "submitted_at": submitted_at,
+                "topup": bool(topup),
+        })
     except Exception as e:
         print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
 
@@ -1676,54 +2306,59 @@ def _clear_resume_manifest(job_id):
         print(f"⚠️ Could not clear resume manifest for {job_id}: {e}")
 
 
-def _resume_interrupted_jobs() -> set:
-    """Re-enqueue jobs that were mid-processing when the server last stopped.
-
-    Runs after _recover_jobs_from_disk: a job whose clips already finished has a
-    metadata JSON and is recovered as 'completed', so we only resume manifests
-    with no metadata yet (analysis never finished). Also called periodically
-    (_resume_scan): a manifest another instance is heartbeating is left alone
-    until that heartbeat goes stale, and a job this instance already holds is
-    never enqueued twice.
-
-    Returns the set of reservation ids for every manifest still on disk —
-    resumed here or alive on the other instance — so the caller can keep them
-    out of the orphaned-reservation refund. Does NO DB work — the DB engine
-    isn't up yet at this point in startup. A poison job (too many attempts) is
-    simply not resumed; its reservation is then refunded as a normal orphan.
-    """
-    keep_reservations: set = set()
+def _legacy_submitted_at(job_id, manifest_mtime=None):
+    """Submission time of a manifest written before ``submitted_at`` existed:
+    the ``.owner`` sidecar is written at submit; else the manifest's own mtime
+    (its last write, the best left); else now."""
     try:
-        entries = os.listdir(OUTPUT_DIR)
-    except FileNotFoundError:
-        return keep_reservations
-    resumed = 0
-    for job_id in entries:
-        job_path = os.path.join(OUTPUT_DIR, job_id)
-        manifest_path = os.path.join(job_path, _RESUME_FILE)
-        if not os.path.isfile(manifest_path):
-            continue
+        return os.path.getmtime(os.path.join(OUTPUT_DIR, job_id, ".owner"))
+    except OSError:
+        pass
+    return manifest_mtime if manifest_mtime else time.time()
+
+
+def _resume_candidates(held: set, now: float):
+    """Disk part of the resume scan (a worker thread on the periodic scan):
+    ``(keep_reservations, [(job_id, manifest)])``. ``held`` is a copy of the
+    ids this instance already has. Each picked manifest is rewritten with its
+    attempt count, ``resumed_at`` and, for one written before it existed, the
+    submission time, so its place in the queue is fixed from now on."""
+    keep_reservations: set = set()
+    picked = []
+    for job_id in _manifest_names():
+        manifest_path = _manifest_path(job_id)
         # A manifest outlives only an interrupted run (the job wrapper drops it
         # at every terminal state), so a metadata file next to it means the job
         # was stopped mid-render, not that it finished: resume it too.
         try:
             with open(manifest_path) as f:
                 m = json.load(f)
+            mtime = os.path.getmtime(manifest_path)
         except Exception as e:
             print(f"⚠️ Bad resume manifest for {job_id}: {e}")
+            continue
+        if not isinstance(m, dict):
             continue
 
         if m.get("reservation_id"):
             keep_reservations.add(str(m["reservation_id"]))
-        if job_id in jobs:
+        if job_id in held:
             continue  # already ours (queued, running or recovered)
-        if _manifest_busy_elsewhere(m):
+        if _manifest_busy_elsewhere(m, now):
             continue  # the other instance is on it; we take over if it goes stale
 
-        attempts = int(m.get("attempts", 0)) + 1
-        user_id = m.get("user_id")
+        # Only a run that STARTED since the last resume counts as an attempt:
+        # the limit is there for a video that crashes the worker, and a video
+        # that only waited in the queue through deploys has crashed nothing.
+        # Counting every resume dropped long-queued videos that never ran
+        # once a few deploys had gone by.
+        ran = (float(m.get("run_started") or m.get("heartbeat") or 0)
+               > float(m.get("resumed_at") or 0))
+        attempts = int(m.get("attempts", 0)) + (1 if ran else 0)
         reservation_id = m.get("reservation_id")
-        if attempts > MAX_RESUME_ATTEMPTS:
+        # A cut delivery runs no main.py again (nothing there can crash the
+        # worker) and its render is done: never dropped as a poison job.
+        if attempts > MAX_RESUME_ATTEMPTS and m.get("stage") != _DELIVERY_STAGE:
             # Poison job: don't resume. Leaving its reservation out of the keep
             # set lets the orphan sweep refund it, and the user can retry by hand.
             print(f"🛑 Job {job_id} exceeded {MAX_RESUME_ATTEMPTS} resume attempts — giving up.")
@@ -1732,6 +2367,30 @@ def _resume_interrupted_jobs() -> set:
                 keep_reservations.discard(str(reservation_id))  # let the sweep refund it
             continue
 
+        m["attempts"] = attempts
+        m["resumed_at"] = now
+        if m.get("submitted_at") is None:
+            m["submitted_at"] = _legacy_submitted_at(job_id, mtime)
+        try:
+            write_json_atomic(manifest_path, m)
+        except Exception:
+            pass
+        picked.append((job_id, m))
+    return keep_reservations, picked
+
+
+def _register_resumed(picked) -> int:
+    """Loop part of the resume scan: a record and a heap entry per picked
+    manifest. The heap orders them by submission time, whatever order the
+    directory listing gave."""
+    resumed = 0
+    for job_id, m in picked:
+        if job_id in jobs:
+            continue  # registered while the disk was being read
+        user_id = m.get("user_id")
+        reservation_id = m.get("reservation_id")
+        attempts = int(m.get("attempts", 0))
+        job_path = os.path.join(OUTPUT_DIR, job_id)
         # Rebuild env from scratch — the manifest holds no secrets. Managed
         # (cloud) jobs get the server key; self-host falls back to its env key.
         env = child_env()
@@ -1761,13 +2420,11 @@ def _resume_interrupted_jobs() -> set:
         else:
             env.pop("DOWNLOAD_SKIP_STATICS", None)
 
-        m["attempts"] = attempts
-        try:
-            with open(manifest_path, "w") as f:
-                json.dump(m, f)
-        except Exception:
-            pass
-
+        priority = int(m.get("priority", 2))
+        # Whatever a remote worker was doing for the instance that held this
+        # job is void now: its next call is refused and it drops the job. A
+        # job cut during its delivery keeps the clips it is delivering.
+        remote_worker.clear(job_path, purge=m.get("stage") != _DELIVERY_STAGE)
         jobs[job_id] = {
             'status': 'queued',
             'logs': _TimedLog([f"♻️ Resuming your video after a server update (attempt {attempts})."]),
@@ -1782,12 +2439,287 @@ def _resume_interrupted_jobs() -> set:
             'webhook_secret': m.get("webhook_secret"),
             'base_url': m.get("base_url"),
             'via_api_key': bool(m.get("via_api_key")),
+            'topup': bool(m.get("topup")),
+            # It ran before (drain-cut, or an instance that died): its expiry
+            # clock and its newest-first place count from that run.
+            'last_run': float(m.get("run_started") or m.get("heartbeat") or 0) or None,
+            # A manifest without a lane predates the lanes: normal lane.
+            'lane': _queue_mode.lane_of_priority(_queue_mode.effective_priority(priority)),
+            'submitted_at': float(m["submitted_at"] if m.get("submitted_at") is not None else time.time()),
         }
-        _enqueue_job(job_id, int(m.get("priority", 2)))
+        if m.get("stage") == _DELIVERY_STAGE:
+            # Rendered already, cut during its delivery: finish the delivery
+            # (from the first step not done), never run main.py again.
+            jobs[job_id]['logs'] = _TimedLog(["♻️ Finishing your video after a server update."])
+            _resume_delivery_record(job_id, jobs[job_id], m)
+            _pending_deliveries.append(job_id)
+            resumed += 1
+            continue
+        _enqueue_job(job_id, priority)
+        if user_id is not None:
+            _owner_plan_pending.add(job_id)  # raised to the owner's plan now
         resumed += 1
     if resumed:
         print(f"♻️  Re-enqueued {resumed} interrupted job(s) after restart.")
-    return keep_reservations
+    return resumed
+
+
+def _resume_interrupted_jobs() -> set:
+    """Re-enqueue jobs that were mid-processing when the server last stopped.
+
+    Runs after _recover_jobs_from_disk: a job whose clips already finished has a
+    metadata JSON and is recovered as 'completed', so we only resume manifests
+    with no metadata yet (analysis never finished). Also called periodically
+    (_resume_scan, through ``_resume_interrupted_jobs_async``): a manifest
+    another instance is heartbeating is left alone until that heartbeat goes
+    stale, and a job this instance already holds is never enqueued twice.
+
+    Returns the set of reservation ids for every manifest still on disk —
+    resumed here or alive on the other instance — so the caller can keep them
+    out of the orphaned-reservation refund. Does NO DB work — the DB engine
+    isn't up yet at this point in startup. A poison job (too many attempts) is
+    simply not resumed; its reservation is then refunded as a normal orphan.
+    """
+    keep, picked = _resume_candidates(set(jobs), time.time())
+    _register_resumed(picked)
+    return keep
+
+
+async def _resume_interrupted_jobs_async() -> set:
+    """The periodic resume scan: the manifests are read (and rewritten) in a
+    worker thread, only the records and the heap are touched on the loop."""
+    keep, picked = await asyncio.to_thread(_resume_candidates, set(jobs), time.time())
+    _register_resumed(picked)
+    _start_pending_deliveries()
+    return keep
+
+
+QUEUE_EXPIRED_LOG = ("❌ The free queue was too busy to start this video in time. "
+                     "No minutes were used: submit it again whenever you like, "
+                     "or skip the line with a plan.")
+QUEUE_EXPIRED_RAN_LOG = ("❌ The free queue was too busy to finish this video in time. "
+                         "No minutes were used: submit it again whenever you like, "
+                         "or skip the line with a plan.")
+
+
+_EXPIRED_MARKER = ".queue_expired"
+
+
+def _expired_marker(job_id):
+    return os.path.join(OUTPUT_DIR, job_id, _EXPIRED_MARKER)
+
+
+def _expired_log(marker_text) -> str:
+    return QUEUE_EXPIRED_RAN_LOG if str(marker_text).startswith("ran") else QUEUE_EXPIRED_LOG
+
+
+def _remove_marker(path, tries=3) -> bool:
+    for _ in range(tries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(0.05)
+    return False
+
+
+def _claim_expiry(last_runs: dict):
+    """Worker thread: claim each job's expiry on the shared disk before
+    anything is released. ``last_runs`` maps job id -> the last run this
+    instance knows of (0 = never ran).
+
+    - Manifest gone: the job ended on the other instance (or never had one):
+      not claimed (``finished`` when its dir says it is done or gone, else
+      ``keep``).
+    - Running elsewhere, or run since we last knew: ``keep``.
+    - Marker already there: the other instance claimed it (``elsewhere``).
+    - Otherwise the marker is created exclusively (so two instances never
+      both end it), the manifest is read again (a run that started meanwhile
+      hands it back), and the manifest is dropped: ``claimed``. A marker that
+      cannot be removed when handing back leaves the job ``stuck``, out of the
+      queue until a later pass removes it, so dispatch never refuses a job
+      whose reservation is still live.
+    """
+    out = {"claimed": [], "elsewhere": [], "keep": [], "finished": [], "stuck": []}
+
+    def ran_since(m, last):
+        return (_manifest_busy_elsewhere(m)
+                or float(m.get("run_started") or 0) > float(last or 0) + 1)
+
+    def gone(jid):
+        d = os.path.join(OUTPUT_DIR, jid)
+        return not os.path.isdir(d) or bool(glob.glob(os.path.join(d, "*_metadata.json")))
+
+    for jid, last in last_runs.items():
+        m = _read_manifest(jid)
+        if m is None:
+            out["finished" if gone(jid) else "keep"].append(jid)
+            continue
+        if ran_since(m, last):
+            out["keep"].append(jid)
+            continue
+        marker = _expired_marker(jid)
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            out["elsewhere"].append(jid)
+            continue
+        except OSError:
+            out["keep"].append(jid)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{'ran' if last else 'unrun'} {int(time.time())}")
+        m = _read_manifest(jid)
+        if m is None or ran_since(m, last):
+            out["keep" if _remove_marker(marker) else "stuck"].append(jid)
+            continue
+        _clear_resume_manifest(jid)
+        out["claimed"].append(jid)
+    return out
+
+
+def _unstick_markers(job_ids) -> list:
+    """Worker thread: retry removing markers left by a hand-back."""
+    return [jid for jid in job_ids if _remove_marker(_expired_marker(jid))]
+
+
+# Jobs handed back by a claim whose marker could not be removed yet:
+# job id -> heap entry. Out of the queue until the marker is gone.
+_unclaim_pending: dict = {}
+
+
+# Seconds between two expiry notices: a jam ends hundreds of jobs in one
+# pass, and the mailbox throttles bursts.
+QUEUE_EXPIRED_EMAIL_GAP = float(os.environ.get("QUEUE_EXPIRED_EMAIL_GAP", "2"))
+_expiry_notices: set = set()   # strong refs to the running notice tasks
+
+
+async def _notify_queue_expired(job_ids) -> int:
+    """Email the owners of free jobs the queue never reached: no minutes
+    used, send it again. A job notice like clips-ready, so not for jobs sent
+    with an API key (the webhook told them), and once per account
+    (``lifecycle.claim``) however many of its videos expired. Returns how
+    many were sent."""
+    if not BILLING_ENABLED:
+        return 0
+    sent = 0
+    for jid in job_ids:
+        job = jobs.get(jid) or {}
+        if not job.get('user_id') or job.get('via_api_key'):
+            continue
+        try:
+            from cloud.database import session as cloud_session
+            from cloud.models import User
+            from cloud.emails import send_queue_expired_email
+            from cloud import lifecycle as _lifecycle
+            async with cloud_session() as s:
+                user = await s.get(User, job['user_id'])
+            if not user or not user.email:
+                continue
+            if not await _lifecycle.claim(user.id, "queue_expired"):
+                continue
+            await send_queue_expired_email(
+                user.email, f"{_cloud_config.settings.frontend_url}/#app")
+            sent += 1
+        except Exception as e:
+            print(f"⚠️  Queue-expired email error for {jid}: {type(e).__name__}")
+        await asyncio.sleep(QUEUE_EXPIRED_EMAIL_GAP)
+    return sent
+
+
+def _expiry_clock(job) -> float:
+    """When a queued job's 24 h start: the latest of its submission, the
+    switching on of the mode (the jobs already waiting then get the whole
+    window) and its last run (a drain-cut or retried video waits from there)."""
+    return max(float(job.get('submitted_at') or 0),
+               float(_queue_mode.enabled_since() or 0),
+               _job_last_run(job))
+
+
+async def _expire_starved_jobs(now=None) -> list:
+    """End, cleanly, the free jobs that have waited ``ACTIVE_JOB_MAX_SECONDS``
+    since ``_expiry_clock`` (only with the saturation mode on, where a lane
+    serving its newest first, or the slow lane, can keep a job waiting; never
+    before the mode's activation time is known). Paid jobs, top-up jobs
+    included, sit above the free priorities and are never considered.
+
+    The same end as any job that did not complete: off the heap, status
+    ``failed`` with a line saying why, resume manifest dropped (so neither
+    instance resumes it and the disk sweeps may age the dir out), reservation
+    released (minutes back; a released reservation keeps the first-video
+    grant for the retry), the caller's webhook told ``job.failed``. No
+    clips-ready email (nothing completed) and not counted as a pipeline
+    failure. A draining instance leaves its queue to the next one."""
+    if not _saturation_on() or _draining:
+        return []
+    if _unclaim_pending:
+        freed = await asyncio.to_thread(_unstick_markers, list(_unclaim_pending))
+        for jid in freed:
+            entry = _unclaim_pending.pop(jid)
+            if (jobs.get(jid) or {}).get('status') == 'queued':
+                job_queue.put_nowait(entry)
+                _queue_changed()
+    if _queue_mode.enabled_since() is None:
+        return []
+    now = time.time() if now is None else now
+    heap = job_queue._queue
+    cand = {}
+    for prio, _key, jid in heap:
+        if prio < _queue_mode.FREE_PRIORITY:
+            continue
+        job = jobs.get(jid)
+        if not job or job.get('status') != 'queued' or jid in _running_jobs:
+            continue
+        if now - _expiry_clock(job) > ACTIVE_JOB_MAX_SECONDS:
+            cand[jid] = _job_last_run(job)
+    if not cand:
+        return []
+    # Off the heap before the disk is touched, so the worker cannot take one
+    # while its claim is being made; the ones handed back are put again.
+    entries = {e[2]: e for e in heap if e[2] in cand}
+    heap[:] = [e for e in heap if e[2] not in cand]
+    heapq.heapify(heap)
+    for _ in entries:
+        try:
+            job_queue.task_done()  # each entry was put once and will not be got
+        except ValueError:
+            break
+    _queue_changed()
+    res = await asyncio.to_thread(_claim_expiry, {j: cand[j] for j in sorted(entries)})
+    for jid in res["keep"]:
+        job_queue.put_nowait(entries[jid])
+    if res["keep"]:
+        _queue_changed()
+    for jid in res["stuck"]:
+        _unclaim_pending[jid] = entries[jid]
+    for jid in res["finished"]:
+        # Ended on the other instance: /api/status answers from disk now.
+        if (jobs.get(jid) or {}).get('status') == 'queued':
+            jobs.pop(jid, None)
+    for jid in res["claimed"] + res["elsewhere"]:
+        job = jobs[jid]
+        job['status'] = 'failed'
+        job['queue_expired'] = True
+        if job.get('logs') is not None:
+            job['logs'].append(QUEUE_EXPIRED_RAN_LOG if cand[jid] else QUEUE_EXPIRED_LOG)
+    # Only the claimer settles and tells: one release, one job.failed.
+    for jid in res["claimed"]:
+        await _settle_reservation(jid, jobs[jid])
+        await _autopilot_job_finished(jid, jobs[jid])
+        await _notify_job_webhook(jid)
+    # The normal lane's owners are told by email (the slow lane's would be
+    # refused again by the brake): most left the tab hours ago.
+    told = [jid for jid in res["claimed"] if entries[jid][0] == _queue_mode.FREE_PRIORITY]
+    if told:
+        task = asyncio.get_running_loop().create_task(_notify_queue_expired(told))
+        _expiry_notices.add(task)
+        task.add_done_callback(_expiry_notices.discard)
+    if res["claimed"]:
+        print(f"⌛ Expired {len(res['claimed'])} free job(s) that waited over "
+              f"{ACTIVE_JOB_MAX_SECONDS // 3600} h in the queue.")
+    return res["claimed"]
 
 
 def _dir_size(path: str) -> int:
@@ -1815,7 +2747,7 @@ def _job_is_active(job_id, now=None) -> bool:
     """True while a job is queued or running here, or its resume manifest says
     it has not reached a terminal state yet (the other instance's jobs during a
     handover included). The disk sweeps must never touch such a job."""
-    if job_id in _running_jobs:
+    if job_id in _running_jobs or job_id in _delivering_jobs:
         return True
     if (jobs.get(job_id) or {}).get('status') in ('queued', 'processing'):
         return True
@@ -1826,9 +2758,76 @@ def _job_is_active(job_id, now=None) -> bool:
     return age <= ACTIVE_JOB_MAX_SECONDS
 
 
+def _manifest_reservations(running: set, queued: set, now: float) -> dict:
+    """Worker thread: ``{reservation_id: alive_since}`` from every manifest.
+
+    Queued here: alive now (the memory pass says so too). Running here or
+    heartbeated by another instance: since the start of that run. Waiting for
+    an instance to resume it: since it was last written or heartbeated.
+    """
+    live = {}
+    for name in _manifest_names():
+        m = _read_manifest(name)
+        rid = (m or {}).get("reservation_id")
+        if not rid:
+            continue
+        if name in queued:
+            since = now
+        elif name in running or _manifest_busy_elsewhere(m, now):
+            since = float(m.get("run_started") or now)
+        else:
+            try:
+                mtime = os.path.getmtime(_manifest_path(name))
+            except OSError:
+                continue
+            since = max(mtime, float(m.get("heartbeat") or 0))
+        live[str(rid)] = max(since, live.get(str(rid), since))
+    return live
+
+
+async def _live_reservation_ids(now=None) -> dict:
+    """Reservations of jobs that are not over, for the metering sweeper, each
+    with the moment it was last known to be moving (``alive_since``; the
+    sweeper frees one alive too long as hung).
+
+    Queued or running here, or with a resume manifest on the shared disk: that
+    covers the other instance of a deploy (its running jobs have manifests)
+    and jobs left for the next instance. A manifest is live whatever this
+    instance's record says: a drain-cancelled job can read 'failed' here and
+    still be resumed elsewhere with its reservation (it must never be
+    refunded). A job queued here is never hung, however long the queue: only
+    a run that does not end, or a manifest nobody takes, gets old. The memory
+    is read here on the loop, the disk in a thread.
+    """
+    now = time.time() if now is None else now
+    running = set(_running_jobs)
+    queued, live = set(), {}
+    for jid, j in list(jobs.items()):
+        if jid in running:
+            since = float(j.get('run_started') or now)
+        elif j.get('status') in ('queued', 'processing'):
+            since = now
+            queued.add(jid)
+        else:
+            continue
+        if j.get('reservation_id'):
+            live[str(j['reservation_id'])] = since
+    on_disk = await asyncio.to_thread(_manifest_reservations, running, queued, now)
+    for rid, since in on_disk.items():
+        live[rid] = max(since, live.get(rid, since))
+    return live
+
+
 def _upload_job_id(filename: str) -> str:
     """Source uploads are stored as ``<job_id>_<name>``."""
     return filename.split("_", 1)[0]
+
+
+def _not_a_job_dir(name) -> bool:
+    """Dot entries of OUTPUT_DIR are the instances' shared state, never a job:
+    the country database (``.geoip/``), the queue watch and mode files, the
+    priority stamp, lock files. No sweep, size cap or purge touches them."""
+    return str(name).startswith(".")
 
 
 def _sweep_expired_job_dirs(now):
@@ -1836,7 +2835,7 @@ def _sweep_expired_job_dirs(now):
     for job_id in os.listdir(OUTPUT_DIR):
         # Not a job: the thumbnails dir backs a StaticFiles mount, so
         # deleting it would 500 every /thumbnails request until reboot.
-        if job_id == os.path.basename(THUMBNAILS_DIR):
+        if job_id == os.path.basename(THUMBNAILS_DIR) or _not_a_job_dir(job_id):
             continue
         job_path = os.path.join(OUTPUT_DIR, job_id)
         if not os.path.isdir(job_path):
@@ -1909,7 +2908,7 @@ def _enforce_output_size_cap():
     thumbs = os.path.basename(THUMBNAILS_DIR)
     candidates = []
     for job_id in os.listdir(OUTPUT_DIR):
-        if job_id == thumbs:
+        if job_id == thumbs or _not_a_job_dir(job_id):
             continue
         p = os.path.join(OUTPUT_DIR, job_id)
         if os.path.isdir(p) and not _job_is_active(job_id):
@@ -1940,7 +2939,7 @@ def _sweep_retained_sources(now=None):
         return
     now = time.time() if now is None else now
     for job_id in os.listdir(OUTPUT_DIR):
-        if job_id == os.path.basename(THUMBNAILS_DIR):
+        if job_id == os.path.basename(THUMBNAILS_DIR) or _not_a_job_dir(job_id):
             continue
         try:
             metas = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
@@ -2008,6 +3007,34 @@ async def cleanup_jobs():
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
 
+BRAKE_CLIPS_LOG = ("⏳ The free queue is very busy right now, so this video gets its "
+                   "{n} best clips. Plans get every clip and skip the line.")
+
+
+def _apply_brake_clips(job):
+    """A slow-lane free job dispatched while the brake is on renders at most
+    ``SLOW_LANE_BRAKE_CLIPS`` clips. Through ``CLIP_TARGET_MIN/MAX`` like the
+    user's own ``target_clips``: the scoring pass still ranks every window,
+    the floor stays enforced in code (here equal to the cap) and the extra
+    clips are dropped by score (``trim_to_best``). Decided at dispatch, so a
+    job resumed after the brake let go gets the full set."""
+    if not job or job.get('env') is None:
+        return
+    cap = _queue_mode.limits()["brake_clips"]
+    env = job['env']
+    try:
+        cap = min(cap, int(env["CLIP_TARGET_MAX"])) if env.get("CLIP_TARGET_MAX") else cap
+        low = min(cap, int(env["CLIP_TARGET_MIN"])) if env.get("CLIP_TARGET_MIN") else cap
+    except ValueError:
+        low = cap
+    env["CLIP_TARGET_MAX"] = str(cap)
+    env["CLIP_TARGET_MIN"] = str(low)
+    job['clips_capped'] = cap
+    logs = job.get('logs')
+    if logs is not None:
+        logs.append(BRAKE_CLIPS_LOG.format(n=cap))
+
+
 async def process_queue():
     """Background worker to process jobs from the queue with concurrency limit."""
     print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
@@ -2015,6 +3042,7 @@ async def process_queue():
         try:
             # Wait for a job (priority, seq, job_id) — lowest priority first.
             _priority, _seq, job_id = await job_queue.get()
+            _queue_changed()
 
             if _draining:
                 # Leave it on disk for the next instance (manifest, no heartbeat).
@@ -2040,8 +3068,28 @@ async def process_queue():
                 print(f"⏸️ Draining — leaving {job_id} for the next instance.")
                 continue
             print(f"🔄 Acquired slot for job: {job_id}")
+            if _priority >= _queue_mode.SLOW_PRIORITY and _queue_mode.brake_active():
+                _apply_brake_clips(jobs.get(job_id))
             _running_jobs.add(job_id)
-            _touch_manifest(job_id)
+            if job_id in jobs:
+                jobs[job_id]['run_started'] = time.time()
+            _touch_manifest(job_id, started=True)
+            if os.path.exists(_expired_marker(job_id)):
+                # The other instance of a deploy ended it as starved a moment
+                # ago (and released its reservation): do not run it.
+                _running_jobs.discard(job_id)
+                concurrency_semaphore.release()
+                job_queue.task_done()
+                if job_id in jobs:
+                    jobs[job_id]['status'] = 'failed'
+                    jobs[job_id]['queue_expired'] = True
+                    try:
+                        with open(_expired_marker(job_id)) as f:
+                            kind = f.read()
+                    except OSError:
+                        kind = ""
+                    jobs[job_id]['logs'].append(_expired_log(kind))
+                continue
 
             # Process in background task to not block the loop (allowing other slots to fill)
             asyncio.create_task(run_job_wrapper(job_id))
@@ -2098,6 +3146,17 @@ async def _track_proxy_usage(job_id):
             print(f"⚠️ Proxy alert failed: {e}")
 
 
+def _release_slot(job_id):
+    """The job left the running set: free what it held. A remote job held a
+    worker slot, never one of the GPU's."""
+    _running_jobs.discard(job_id)
+    if job_id in _remote_jobs:
+        _remote_jobs.discard(job_id)
+    else:
+        concurrency_semaphore.release()
+    job_queue.task_done()
+
+
 async def run_job_wrapper(job_id):
     """Wrapper to run job and release semaphore"""
     # Keep the record itself: run_job writes its status into this same dict,
@@ -2109,7 +3168,9 @@ async def run_job_wrapper(job_id):
     try:
         if job:
             await run_job(job_id, job)
-            if job.get('status') == 'completed':
+            # The queue's ETA is about this host's slots: a remote render,
+            # several times slower, would skew it.
+            if job.get('status') == 'completed' and job_id not in _remote_jobs:
                 _record_job_duration(time.monotonic() - started)
     except asyncio.CancelledError:
         # The server is shutting down (drain timeout of a deploy) and took this
@@ -2121,47 +3182,206 @@ async def run_job_wrapper(job_id):
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
         if interrupted or (_stopping and job and job.get('status') != 'completed'):
-            _running_jobs.discard(job_id)
-            concurrency_semaphore.release()
-            job_queue.task_done()
+            _release_slot(job_id)
             print(f"♻️ Server stopping: leaving {job_id} for the next instance.")
             if interrupted:
                 raise asyncio.CancelledError()
             return
         if _should_auto_retry(job):
             _schedule_auto_retry(job_id, job)
-            _running_jobs.discard(job_id)
-            concurrency_semaphore.release()
-            job_queue.task_done()
+            _release_slot(job_id)
             print(f"🔁 Released slot for job {job_id} (auto-retry scheduled).")
             return
-        # The subprocess returned (success or genuine failure) — a terminal
-        # state, so drop the resume manifest. It only survives if the container
-        # was killed mid-run, which is exactly when we want to resume.
-        _clear_resume_manifest(job_id)
-        # Settle the minute reservation (managed jobs only): commit on success,
-        # release otherwise so the minutes go back to the user.
-        await _settle_reservation(job_id, job)
-        # Archive the completed clips to the user's durable R2 library (history).
-        await _archive_managed_job(job_id)
-        # Autopilot bookkeeping + autopublish (before the generic clips-ready
-        # email, which it replaces for its own jobs).
-        await _autopilot_job_finished(job_id, job)
-        # Fire the caller's webhook (after archive, so durable links exist).
-        await _notify_job_webhook(job_id)
-        # Operational alerting for managed jobs (proxy out of credits / failures).
-        await _record_job_alert(job_id)
-        # Accumulate proxy bandwidth for the monthly cost alert.
-        await _track_proxy_usage(job_id)
-        # Tell the owner their clips are ready (managed jobs, once per job).
-        await _notify_clips_ready(job_id)
-        # Telegram pulse for high-signal activity (first clip / paid user).
-        await _notify_clip_activity(job_id)
-        # Always release semaphore and mark queue task done
-        _running_jobs.discard(job_id)
-        concurrency_semaphore.release()
-        job_queue.task_done()
+        # The subprocess returned (success or genuine failure): a terminal
+        # state. What is left (settle, R2 archive, unmark, webhook, emails) is
+        # network I/O that never touches the card, so the GPU slot goes to the
+        # next job now and the delivery runs outside it. The job enters the
+        # delivery stage (manifest stamped, ``_delivering_jobs``) BEFORE it
+        # leaves ``_running_jobs``: a drain or a scan never sees it in neither.
+        if job is not None:
+            _begin_delivery(job_id, job)
+        _release_slot(job_id)
         print(f"✅ Released slot for job: {job_id}")
+    if job is not None:
+        await _deliver_job(job_id, job)
+    else:
+        _clear_resume_manifest(job_id)
+
+
+# --- Delivery, outside the GPU slot -------------------------------------------
+# A finished job still has to settle its minutes, upload its clips to R2, be
+# unmarked if its owner paid meanwhile and tell the caller (webhook, email).
+# That used to run while the job held its GPU slot, so the card sat idle for it
+# on every job. Now it runs after the slot is released, at most
+# DELIVERY_CONCURRENCY at a time (a slow R2 queues deliveries instead of piling
+# up uploads), and:
+#   * the user sees 'processing' until the clips are archived and unmarked
+#     (``_presented_status``): no finished job with half of its delivery done;
+#   * the resume manifest stays on disk, stamped ``stage: delivering`` with the
+#     outcome and each step done, and is heartbeated, until the last step: a
+#     drain waits for deliveries like for running jobs, and a delivery cut
+#     anyway (drain timeout, killed container) is resumed by the next instance
+#     from the first step not done, without running main.py again.
+def _env_int(name, default, minimum=0):
+    try:
+        return max(minimum, int(os.environ.get(name, str(default)).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+DELIVERY_CONCURRENCY = _env_int("DELIVERY_CONCURRENCY", 4, minimum=1)
+_delivery_semaphore = asyncio.Semaphore(DELIVERY_CONCURRENCY)
+_delivering_jobs: set = set()        # job ids whose delivery has not ended here
+_pending_deliveries: list = []       # resumed deliveries waiting for the DB (boot)
+_DELIVERY_STAGE = "delivering"
+# Steps in order; the job reads finished to the user after the step named by
+# _DELIVERY_VISIBLE_AFTER, before anything tells the caller (webhook, email),
+# so a caller that polls on the webhook already reads 'completed'.
+_DELIVERY_STEPS = (
+    # Commit the minutes on success, release them otherwise.
+    ("settle", lambda jid, job: _settle_reservation(jid, job)),
+    # The completed clips to the user's durable R2 library (history).
+    ("archive", lambda jid, job: _archive_managed_job(jid)),
+    # Rendered for the free plan but the owner pays now: deliver it clean.
+    ("unmark", lambda jid, job: _unmark_if_owner_paid(jid, job)),
+    # Autopilot bookkeeping + autopublish (before the clips-ready email,
+    # which it replaces for its own jobs).
+    ("autopilot", lambda jid, job: _autopilot_job_finished(jid, job)),
+    # The caller's webhook (after the archive, so durable links exist).
+    ("webhook", lambda jid, job: _notify_job_webhook(jid)),
+    # Operational alerting (proxy out of credits / failures) and analytics.
+    ("alert", lambda jid, job: _record_job_alert(jid)),
+    # Proxy bandwidth for the monthly cost alert.
+    ("proxy", lambda jid, job: _track_proxy_usage(jid)),
+    # Tell the owner their clips are ready (once per job).
+    ("email", lambda jid, job: _notify_clips_ready(jid)),
+    # Telegram pulse for a paid user's clips.
+    ("activity", lambda jid, job: _notify_clip_activity(jid)),
+)
+_DELIVERY_VISIBLE_AFTER = "unmark"
+
+
+def _stamp_delivery(job_id, job, done):
+    """Write the delivery stage into the job's manifest: outcome, the files
+    main.py announced, the error text of a failed job and the steps done, so
+    another instance can finish the delivery. No manifest: nothing to do."""
+    m = _read_manifest(job_id)
+    if m is None:
+        return
+    m["stage"] = _DELIVERY_STAGE
+    m["outcome"] = job.get('status') if job.get('status') in ('completed', 'failed') else 'failed'
+    m["ready_files"] = {str(k): v for k, v in (job.get('ready_files') or {}).items()}
+    if m["outcome"] != 'completed':
+        m["error"] = _job_error_text(list(job.get('logs') or []))[-500:]
+    m["delivered"] = sorted(done)
+    m["heartbeat"] = time.time()
+    m["instance"] = INSTANCE_ID
+    try:
+        write_json_atomic(_manifest_path(job_id), m)
+    except Exception as e:
+        print(f"⚠️ Could not stamp the delivery of {job_id}: {e}")
+
+
+def _begin_delivery(job_id, job):
+    """Enter the delivery stage (on the loop, before the slot is released)."""
+    _delivering_jobs.add(job_id)
+    job['delivering'] = True
+    _stamp_delivery(job_id, job, set(job.get('delivered') or ()))
+
+
+async def _delivery_heartbeat(job_id):
+    while True:
+        await asyncio.sleep(HEARTBEAT_EVERY)
+        _touch_manifest(job_id)
+
+
+async def _deliver_job(job_id, job):
+    """Run the delivery steps not done yet, then drop the manifest. Each step
+    already guards its own errors; one that raises anyway is logged and the
+    delivery goes on. Cancelled (the process is going away): the manifest
+    stays, so the next instance finishes the delivery."""
+    if job_id not in _delivering_jobs:
+        _begin_delivery(job_id, job)
+    done = set(job.get('delivered') or ())
+    heartbeat = asyncio.create_task(_delivery_heartbeat(job_id))
+    cancelled = False
+    try:
+        async with _delivery_semaphore:
+            for name, step in _DELIVERY_STEPS:
+                if name not in done:
+                    try:
+                        await step(job_id, job)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"⚠️ Delivery step {name} failed for {job_id}: {e}")
+                    done.add(name)
+                    job['delivered'] = sorted(done)
+                    _stamp_delivery(job_id, job, done)
+                if name == _DELIVERY_VISIBLE_AFTER:
+                    job.pop('delivering', None)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        heartbeat.cancel()
+        if not cancelled:
+            _clear_resume_manifest(job_id)
+            job.pop('delivering', None)
+        _delivering_jobs.discard(job_id)
+
+
+def _result_from_disk(job_id, output_dir):
+    """The result of a job whose main.py exited 0, rebuilt from its dir (the
+    clips main.py announced, or the canonical files). None: nothing rendered."""
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        return None
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+    rendered, _missing = _clips_actually_rendered(
+        job_id, output_dir, base_name, data.get('shorts', []))
+    if not rendered:
+        return None
+    return {'clips': rendered, 'cost_analysis': data.get('cost_analysis')}
+
+
+def _resume_delivery_record(job_id, job, m):
+    """Turn a resumed record into a delivery: outcome from the manifest, the
+    result from the disk. Called with ``jobs[job_id]`` already set."""
+    job['ready_files'] = {}
+    for k, v in (m.get("ready_files") or {}).items():
+        try:
+            job['ready_files'][int(k)] = v
+        except (TypeError, ValueError):
+            pass
+    job['delivered'] = list(m.get("delivered") or [])
+    job['delivering'] = True
+    status = m.get("outcome") if m.get("outcome") in ('completed', 'failed') else 'failed'
+    if status == 'completed':
+        try:
+            job['result'] = _result_from_disk(job_id, job['output_dir'])
+        except Exception as e:
+            print(f"⚠️ Could not rebuild the result of {job_id}: {e}")
+            job['result'] = None
+        if not job['result']:
+            status = 'failed'
+            job['logs'].append("No clips could be rendered from this video.")
+    elif m.get("error"):
+        job['logs'].append(str(m["error"]))
+    job['status'] = status
+
+
+def _start_pending_deliveries():
+    """Start the deliveries resumed from manifests (the DB is up by now)."""
+    while _pending_deliveries:
+        jid = _pending_deliveries.pop(0)
+        job = jobs.get(jid)
+        if job is not None and jid not in _delivering_jobs:
+            _begin_delivery(jid, job)   # ours now: our instance id, fresh heartbeat
+            print(f"📦 Finishing the delivery of {jid} left by another instance.")
+            asyncio.create_task(_deliver_job(jid, job))
 
 
 # --- Automatic retry of transient failures ----------------------------------
@@ -2195,9 +3415,17 @@ def is_transient_failure(logs) -> bool:
 
 
 def _should_auto_retry(job) -> bool:
-    return bool(job and job.get('status') == 'failed' and not _draining
-                and int(job.get('auto_retries') or 0) < AUTO_RETRY_LIMIT
-                and job.get('cmd') and is_transient_failure(job.get('logs')))
+    # A run on the remote worker that did not complete is always run again
+    # here, whatever it printed: this host decides what a video's failure is.
+    if not (job and job.get('status') == 'failed' and not _draining and job.get('cmd')):
+        return False
+    # YouTube limiting the account is neither the video's fault nor a server
+    # fault: the job waits out the cooldown, a few times at most, on its own
+    # counter (it has not used its one retry for real failures).
+    if job.get('yt_limited'):
+        return int(job.get('yt_retries') or 0) < YT_LIMIT_RETRIES
+    return bool(int(job.get('auto_retries') or 0) < AUTO_RETRY_LIMIT
+                and (job.get('remote_failed') or is_transient_failure(job.get('logs'))))
 
 
 def _clean_for_retry(output_dir):
@@ -2216,23 +3444,40 @@ def _clean_for_retry(output_dir):
                 pass
 
 
+YT_LIMIT_RETRIES = _int_env("YT_LIMIT_RETRIES", 3)
+YT_LIMITED_LOG = ("⏳ YouTube is limiting downloads right now. Your video keeps its place "
+                  "and starts again in about {n} min, no minutes are charged twice.")
+
+
 def _schedule_auto_retry(job_id, job):
-    job['auto_retries'] = int(job.get('auto_retries') or 0) + 1
+    delay = AUTO_RETRY_DELAY_SECONDS
+    if job.pop('yt_limited', None):
+        # Back in line for when the account's cooldown is over (plus a spread,
+        # so the videos that waited do not all ask YouTube in the same second).
+        job['yt_retries'] = int(job.get('yt_retries') or 0) + 1
+        delay = max(delay, yt_account.cooling_down()) + 20 + (hash(job_id) % 120)
+        job['logs'].append(YT_LIMITED_LOG.format(n=max(1, round(delay / 60))))
+        print(f"⏳ {job_id} waits {delay:.0f}s for the YouTube account "
+              f"({job['yt_retries']}/{YT_LIMIT_RETRIES}).")
+    else:
+        job['auto_retries'] = int(job.get('auto_retries') or 0) + 1
+        job['logs'].append("🔁 A temporary server problem interrupted your video. "
+                           "Retrying it automatically, no minutes are charged twice.")
+        print(f"🔁 Auto-retry {job['auto_retries']}/{AUTO_RETRY_LIMIT} for {job_id} "
+              f"in {AUTO_RETRY_DELAY_SECONDS:.0f}s.")
+    job.pop('remote_failed', None)
     job['status'] = 'queued'
     job['result'] = None
     job['ready_files'] = {}
-    job['logs'].append("🔁 A temporary server problem interrupted your video. "
-                       "Retrying it automatically, no minutes are charged twice.")
     _clean_for_retry(job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id))
-    m = _read_manifest(job_id) or {}
-    priority = int(m.get("priority", 1))
-    print(f"🔁 Auto-retry {job['auto_retries']}/{AUTO_RETRY_LIMIT} for {job_id} "
-          f"in {AUTO_RETRY_DELAY_SECONDS:.0f}s.")
 
     async def _later():
-        await asyncio.sleep(AUTO_RETRY_DELAY_SECONDS)
+        await asyncio.sleep(delay)
         if job_id in jobs and jobs[job_id].get('status') == 'queued':
-            _enqueue_job(job_id, priority)
+            # Read now, not when scheduled: an upgrade in between rewrote it.
+            m = _read_manifest(job_id) or {}
+            _enqueue_job(job_id, int(m.get("priority", 1)))
+            await _raise_to_owner_plans([job_id])
 
     asyncio.create_task(_later())
 
@@ -2250,6 +3495,34 @@ async def _archive_managed_job(job_id):
         await cloud.videos.archive_job(job['user_id'], job_id, clips, job['output_dir'])
     except Exception as e:
         print(f"⚠️  R2 archive error for {job_id}: {e}")
+
+
+async def _unmark_if_owner_paid(job_id, job):
+    """A job queued (or running) on the free plan carries the mark; if its owner
+    is on a live paid plan when it lands, the upgrade's promise covers it too.
+
+    The upgrade webhook unmarks only the clips that exist at that moment, so
+    this runs at delivery, after the archive and before the webhook and the
+    clips-ready email: the same re-pointing as an upgrade
+    (``videos.unmark_user_library``) limited to this job. Canonical files were
+    never marked; the twins are re-pointed only when they are in R2, and
+    ``_unmark_local_job`` drops ``.marked`` with them. Never raises: a failure
+    leaves the job marked, as it was.
+    """
+    if not BILLING_ENABLED or not job or job.get('status') != 'completed':
+        return
+    owner = job.get('user_id')
+    job_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
+    if owner is None or not watermarked.job_is_marked(job_dir):
+        return
+    try:
+        if str(owner) not in await _owner_live_plans([str(owner)]):
+            return
+        n = await cloud.videos.unmark_user_library(owner, job_id=job_id)
+        if n:
+            print(f"🏷️ Delivered {job_id} clean: its owner paid while it waited.")
+    except Exception as e:
+        print(f"⚠️ Could not unmark {job_id} for its paying owner: {e}")
 
 
 def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
@@ -2285,6 +3558,15 @@ async def _autopilot_job_finished(job_id, job):
         print(f"⚠️  Autopilot completion error for {job_id}: {e}")
 
 
+def _clips_ready_url():
+    """Where "View my clips" lands: the History tab, which lists every job's
+    clips. Plain #app opened the Clip Generator, which shows a finished job
+    only in the browser that ran it, so the email opened on a phone showed an
+    empty generator. Signed out, the dashboard asks to sign in and comes back
+    to History afterwards (rememberTabAfterLogin in the dashboard)."""
+    return f"{_cloud_config.settings.frontend_url}/#app?tab=history"
+
+
 async def _notify_clips_ready(job_id):
     """Email the owner when their clips finish — processing takes minutes, so
     this lets them close the tab. Once per job (email_sent flag). Jobs sent
@@ -2310,11 +3592,7 @@ async def _notify_clips_ready(job_id):
         if not user or not user.email:
             return
         title = clips[0].get('video_title_for_youtube_short') or clips[0].get('title') or "Your video"
-        # #app opens the app itself. The bare frontend URL showed the marketing
-        # landing to anyone whose browser had not already set the skip flag,
-        # which is the wrong page for someone clicking "View my clips".
-        await send_clips_ready_email(user.email, title, len(clips),
-                                     f"{_cloud_config.settings.frontend_url}/#app")
+        await send_clips_ready_email(user.email, title, len(clips), _clips_ready_url())
     except Exception as e:
         print(f"⚠️  Clips-ready email error for {job_id}: {e}")
 
@@ -2576,6 +3854,31 @@ def _rm_under(base_dir: str, relative: str):
             pass
 
 
+def _support_ops_local_jobs(user_id) -> dict:
+    """This process's in-memory jobs of one user, for the support back-office's
+    activity view (cloud/support_ops.py): live status, why a failed one failed,
+    where its source came from. Read-only."""
+    uid = str(user_id)
+    out = {}
+    for job_id, job in list(jobs.items()):
+        if str(job.get('user_id')) != uid:
+            continue
+        status = job.get('status')
+        error = None
+        if status == 'failed':
+            try:
+                error = _job_error_text(list(job.get('logs') or []))[-500:]
+            except Exception:
+                error = None
+        out[job_id] = {
+            'status': status,
+            'error': error,
+            'source': (job.get('attestation') or {}).get('source'),
+            'created_at': job.get('submitted_at'),
+        }
+    return out
+
+
 def _purge_local_jobs_for_user(user_id) -> int:
     """Delete this user's working files and in-memory records from local disk.
 
@@ -2606,7 +3909,7 @@ def _purge_local_jobs_for_user(user_id) -> int:
     for job_id in entries:
         # Never a job, and it backs a StaticFiles mount: deleting the directory
         # itself 500s every /thumbnails request until the process restarts.
-        if job_id == thumbs_dir_name:
+        if job_id == thumbs_dir_name or _not_a_job_dir(job_id):
             continue
         try:
             with open(os.path.join(OUTPUT_DIR, job_id, ".owner")) as f:
@@ -2653,12 +3956,122 @@ def _purge_local_jobs_for_user(user_id) -> int:
     return removed
 
 
+# --- Queue watch hooks (cloud/queue_watch.py pages when the queue backs up) ---
+
+# Where the last jobs' Parakeet ran ("cuda"/"cpu"), oldest first, from each
+# job's JOB_CPU line. A job that never loaded Parakeet (whisper backend, a
+# retry that reused its transcript) reports nothing and is not counted.
+_recent_asr_devices: list = []
+
+
+def _note_job_asr(payload):
+    try:
+        device = json.loads(payload).get("asr_device")
+    except Exception:
+        return
+    if device in ("cuda", "cpu"):
+        _recent_asr_devices.append(device)
+        del _recent_asr_devices[:-12]
+
+
+def _queue_watch_snapshot():
+    """This instance's queue as the queue watch measures it (in memory, plus
+    the manifest of the one or two jobs already off the queue)."""
+    try:
+        entries = list(job_queue._queue)  # (priority, seq, job_id)
+    except Exception:
+        entries = []
+    prio = {}
+    for p, _seq, jid in entries:
+        prio[jid] = min(p, prio.get(jid, p))
+    plans = getattr(_cloud_config, "PLAN_PRIORITY", None) or {}
+    free_priority = plans.get("free", 2)
+    waiting = []
+    for jid in set(prio) | set(_admitting):
+        job = jobs.get(jid)
+        if not job or job.get('status') != 'queued':
+            continue
+        p = prio.get(jid)
+        if p is None:  # taken off the queue, waiting for a slot
+            p = (_read_manifest(jid) or {}).get("priority")
+            if p is None:
+                p = plans.get(job.get('user_plan'), free_priority)
+        waiting.append({"id": jid, "paid": int(p) < free_priority,
+                        "lane": (_queue_mode.lane_of_priority(p) if int(p) >= free_priority
+                                 else None),
+                        "attempt": int(job.get('auto_retries') or 0)})
+    # Output rate: finished jobs whose last log line is from the last hour. A
+    # job recovered from disk at boot carries a single synthetic line: skip it.
+    cutoff = time.time() - 3600
+    done = 0
+    for job in list(jobs.values()):
+        if job.get('status') not in ('completed', 'failed'):
+            continue
+        if job.get('queue_expired'):
+            continue  # never ran: not output, and a batch of them is no rate
+        times = getattr(job.get('logs'), 'times', None)
+        if times and len(times) > 1 and times[-1] >= cutoff:
+            done += 1
+    sample = sorted(_recent_job_seconds)
+    typical = sample[len(sample) // 2] if sample else DEFAULT_JOB_SECONDS
+    paid = sum(1 for w in waiting if w["paid"])
+    normal = sum(1 for w in waiting if w["lane"] == _queue_mode.NORMAL)
+    slow = sum(1 for w in waiting if w["lane"] == _queue_mode.SLOW)
+    running = len(_running_jobs)
+    # What a job joining the back of each free lane would wait in FIFO: the
+    # normal lane has the paid jobs in front, the slow lane everything.
+    lanes = {
+        _queue_mode.NORMAL: {"queued": normal, "wait": queue_estimate(
+            paid + normal, running, MAX_CONCURRENT_JOBS, typical)},
+        _queue_mode.SLOW: {"queued": slow, "wait": queue_estimate(
+            len(waiting), running, MAX_CONCURRENT_JOBS, typical)},
+    }
+    return {
+        "waiting": waiting,
+        "running": len(_running_jobs),
+        "slots": MAX_CONCURRENT_JOBS,
+        "done_last_hour": done,
+        "eta_free": queue_estimate(len(waiting), len(_running_jobs), MAX_CONCURRENT_JOBS, typical),
+        "eta_paid": queue_estimate(paid, len(_running_jobs), MAX_CONCURRENT_JOBS, typical),
+        # nvidia-smi answered at the last admission check (cached, no call here).
+        "gpu": _gpu_free_cache["mb"] is not None,
+        "asr_devices": list(_recent_asr_devices),
+        "lanes": lanes,
+    }
+
+
+def _queue_wait_started(job_id):
+    """When a queued job's current wait began, read from disk so a redeploy
+    does not reset it: its submission (``.owner`` is written at submit) or,
+    if any instance has run it since (resumed after a deploy, auto-retried),
+    the last heartbeat of that run. None when the disk says nothing."""
+    job = jobs.get(job_id) or {}
+    out_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
+    stamps = []
+    try:
+        stamps.append(os.path.getmtime(os.path.join(out_dir, ".owner")))
+    except OSError:
+        pass
+    m = _read_manifest(job_id) or {}
+    # A heartbeat (it ran since) or a raise to a paid priority (its owner paid
+    # while it waited: its wait as a paid job starts there) restarts the clock.
+    for stamp in (m.get("heartbeat"), m.get("raised_at"), job.get('raised_at')):
+        if stamp:
+            stamps.append(float(stamp))
+    if not stamps:
+        times = getattr(job.get('logs'), 'times', None)
+        if times:
+            stamps.append(times[-1])
+    return max(stamps) if stamps else None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
     # Re-enqueue jobs that were mid-processing when we stopped (redeploy). Their
     # reservations must survive the orphan sweep so the resumed run can settle them.
+    _booted_at = datetime.now(timezone.utc)
     _resumed_reservation_ids = _resume_interrupted_jobs()
     # Deploy handover: claim the marker (any older instance sees it and drains),
     # keep watching it in case a newer one appears, keep looking for manifests
@@ -2667,18 +4080,34 @@ async def lifespan(app: FastAPI):
     _install_drain_signal_handler()
     asyncio.create_task(_handover_watch())
     asyncio.create_task(_resume_scan())
-    # Start worker and cleanup
-    worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
     if BILLING_ENABLED:
-        await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
+        await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids,
+                                live_reservation_ids=_live_reservation_ids,
+                                sweep_active=lambda: not _draining,
+                                booted_at=_booted_at)
+        # The jobs resumed above carry the priority of the plan at submit;
+        # the DB is up now: owners who paid since go first (one lookup, which
+        # never raises: a failure keeps the manifests' priorities).
+        await _raise_to_owner_plans()
+    # Deliveries cut by the last instance (rendered, not delivered) need the
+    # DB, which is up now.
+    _start_pending_deliveries()
+    # The worker starts only now, so the first job it takes off the queue was
+    # already ranked by its owner's current plan.
+    worker_task = asyncio.create_task(process_queue())
+    if BILLING_ENABLED:
         # Account erasure lives in cloud/, which can't import app.py; hand it the
         # one thing only this module can do — wipe the local working files.
         cloud.account.register_local_purge(_purge_local_jobs_for_user)
+        # The support back-office's activity view reads live job state too.
+        cloud.support_ops.register_local_jobs(_support_ops_local_jobs)
         # Same arrangement for the watermark: when a user upgrades, cloud/videos
         # re-points their clips at the clean twins in R2 and hands us each
         # one so the working copy (and an open dashboard) follows.
         cloud.videos.register_local_unmark(_unmark_local_job)
+        # And for the queue: paying moves the user's waiting videos up.
+        cloud.billing.register_local_reprioritize(reprioritize_user_jobs)
         # Autopilot: watch connected YouTube channels for new videos. Paused
         # while this instance drains so only the new container submits jobs.
         cloud.autopilot.start(app, is_active=lambda: not _draining)
@@ -2688,6 +4117,21 @@ async def lifespan(app: FastAPI):
         # a single job-failure alert is easy to miss and ingest stays broken
         # until someone tops the balance up.
         asyncio.create_task(_alerts.proxy_watch_loop())
+        # Page when the render queue backs up (paid job waiting, free backlog).
+        # Only the newest instance measures; state is shared through output/.
+        from cloud import queue_watch as _queue_watch
+        if not _queue_mode.enabled():
+            # Off at boot: switching it on later starts a fresh expiry window.
+            _queue_mode.forget_activation(OUTPUT_DIR)
+        _queue_watch.start(
+            snapshot=_queue_watch_snapshot, wait_started=_queue_wait_started,
+            busy_elsewhere=_jobs_busy_elsewhere, state_dir=OUTPUT_DIR,
+            is_active=lambda: not _draining and _read_instance_marker() in (None, INSTANCE_ID))
+        # Client country for the free slow lane: a local database, kept on
+        # the shared disk and refreshed only while a slow-lane country is set.
+        from cloud import geoip as _geoip
+        _geoip.start(OUTPUT_DIR, wanted=lambda: bool(_queue_mode.slow_countries())
+                     and not _queue_mode.killed())
     yield
     # Cleanup (optional: cancel worker)
 
@@ -2720,6 +4164,9 @@ app.add_middleware(
     # they only become readable to JS once they are named here.
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
 )
+if BILLING_ENABLED:
+    # Outside CORS: the support-ops routes never answer a browser.
+    app.add_middleware(cloud.support_ops.CorsGuard)
 
 # --- Who may read /videos and /thumbnails ------------------------------------
 # A job id used to be the whole lock on a job's clips and on the untouched
@@ -3058,49 +4505,87 @@ def _visible_logs(logs):
     return friendly_logs(logs)
 
 
+def _handle_job_line(job_id, line, remote=False):
+    """One output line of a job's main.py: internal markers are consumed, the
+    rest goes to the job's log. ``remote``: the line came from the worker."""
+    decoded_line = _scrub_secrets(line.strip())
+    if not decoded_line:
+        return
+    # Internal marker: a clip finished its whole chain and this is the file to
+    # serve for it. Consumed here like PROXY_BYTES so it never reaches the
+    # user's log.
+    if decoded_line.startswith("CLIP_READY "):
+        try:
+            _, index, filename = decoded_line.split(" ", 2)
+            # From the worker, only a plain .mp4 name of the job's own dir.
+            plain = not remote or (os.sep not in filename and "/" not in filename
+                                   and filename.lower().endswith(".mp4")
+                                   and remote_worker.safe_relpath(filename) == filename)
+            if remote and plain and (jobs.get(job_id) or {}).get('watermark'):
+                # Free plan: only the marked copy is ever announced.
+                plain = watermarked.is_marked(filename)
+            if job_id in jobs and plain:
+                jobs[job_id].setdefault('ready_files', {})[int(index)] = filename
+        except ValueError:
+            pass
+        return
+    if decoded_line.startswith("JOB_CPU "):
+        # Internal marker: the job's CPU time (main.py, at exit).
+        print(f"📊 [job-cpu{'-remote' if remote else ''}] {job_id} {decoded_line[8:]}")
+        if not remote:
+            # The worker transcribes on its CPU by design: only this host's
+            # jobs say whether the GPU build of onnxruntime is the one loaded.
+            _note_job_asr(decoded_line[8:])
+        return
+    if remote and decoded_line.startswith(("SOURCE_READY ", "PROXY_BYTES=", "PROXY_ROUTE=",
+                                           "YT_ACCOUNT_LIMITED")):
+        return        # this host's own markers: the worker has no say in them
+    if decoded_line.startswith("SOURCE_READY "):
+        # Internal marker of ``main.py --prepare-only``: where the source is.
+        if job_id in jobs:
+            jobs[job_id]['remote_source'] = decoded_line.split(" ", 1)[1].strip()
+        return
+    if decoded_line.startswith("YT_ACCOUNT_LIMITED"):
+        # Internal marker from main.py's downloader: the download failed only
+        # because YouTube is limiting the account (yt_account). The job goes
+        # back in line for when the cooldown is over (_schedule_auto_retry).
+        if job_id in jobs:
+            jobs[job_id]['yt_limited'] = True
+        return
+    if decoded_line.startswith("PROXY_BYTES="):
+        # Internal marker from main.py's downloader, not a log line.
+        try:
+            if job_id in jobs:
+                jobs[job_id]['proxy_bytes'] = int(decoded_line.split("=", 1)[1])
+        except ValueError:
+            pass
+        return
+    if decoded_line.startswith("PROXY_ROUTE="):
+        # Which download attempt won and why the free ones failed;
+        # persisted at job end (cloud/proxy_ledger). Not shown to clients.
+        try:
+            from cloud import proxy_ledger as _pl
+            route = _pl.parse_route_line(decoded_line)
+            if route is not None and job_id in jobs:
+                jobs[job_id]['proxy_route'] = route
+        except Exception:
+            pass
+        return
+    if remote and job_id in jobs and len(jobs[job_id]['logs']) >= REMOTE_MAX_LOG_LINES:
+        return        # a render prints a few hundred lines; the rest is noise
+    print(f"📝 [Job Output] {decoded_line}")
+    if job_id in jobs:
+        jobs[job_id]['logs'].append(decoded_line)
+
+
+REMOTE_MAX_LOG_LINES = 5000
+
+
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
     try:
         for line in iter(out.readline, b''):
-            decoded_line = _scrub_secrets(line.decode('utf-8').strip())
-            if decoded_line:
-                # Internal marker from main.py's downloader, not a log line.
-                # Internal marker: a clip finished its whole chain and this is
-                # the file to serve for it. Consumed here like PROXY_BYTES so it
-                # never reaches the user's log.
-                if decoded_line.startswith("CLIP_READY "):
-                    try:
-                        _, index, filename = decoded_line.split(" ", 2)
-                        if job_id in jobs:
-                            jobs[job_id].setdefault('ready_files', {})[int(index)] = filename
-                    except ValueError:
-                        pass
-                    continue
-                if decoded_line.startswith("JOB_CPU "):
-                    # Internal marker: the job's CPU time (main.py, at exit).
-                    print(f"📊 [job-cpu] {job_id} {decoded_line[8:]}")
-                    continue
-                if decoded_line.startswith("PROXY_BYTES="):
-                    try:
-                        if job_id in jobs:
-                            jobs[job_id]['proxy_bytes'] = int(decoded_line.split("=", 1)[1])
-                    except ValueError:
-                        pass
-                    continue
-                if decoded_line.startswith("PROXY_ROUTE="):
-                    # Which download attempt won and why the free ones failed;
-                    # persisted at job end (cloud/proxy_ledger). Not shown to clients.
-                    try:
-                        from cloud import proxy_ledger as _pl
-                        route = _pl.parse_route_line(decoded_line)
-                        if route is not None and job_id in jobs:
-                            jobs[job_id]['proxy_route'] = route
-                    except Exception:
-                        pass
-                    continue
-                print(f"📝 [Job Output] {decoded_line}")
-                if job_id in jobs:
-                    jobs[job_id]['logs'].append(decoded_line)
+            _handle_job_line(job_id, line.decode('utf-8', 'replace'))
     except Exception as e:
         print(f"Error reading output for job {job_id}: {e}")
     finally:
@@ -3151,8 +4636,138 @@ async def _paid_proxy_budget_exceeded() -> bool:
         return False
 
 
+def _refresh_partial_result(job_id, output_dir):
+    """While a job runs: the clips main.py has announced so far, so the user
+    sees each one as it lands."""
+    try:
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            return
+        target_json = json_files[0]
+        # It might be being written to: a partial file fails json.load and
+        # the next look reads it whole.
+        if os.path.getsize(target_json) <= 0:
+            return
+        with open(target_json, 'r') as f:
+            data = json.load(f)
+        clips = data.get('shorts', [])
+        cost_analysis = data.get('cost_analysis')
+        # Only clips main.py has announced as finished. It names the file
+        # itself, so a clip shows up WITH its hook and captions instead of as
+        # the bare reframe, and it is never served while ffmpeg is still
+        # writing it. A clip whose marker never arrives (it failed) simply
+        # stays hidden until the job ends and the result is rebuilt from disk.
+        ready_files = (jobs.get(job_id) or {}).get('ready_files') or {}
+        ready_clips = []
+        for i, clip in enumerate(clips):
+            clip_filename = ready_files.get(i)
+            if not clip_filename:
+                continue
+            clip_path = os.path.join(output_dir, clip_filename)
+            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+                ready_clips.append(clip)
+        if ready_clips:
+            jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
+    except Exception:
+        # Ignore read errors during processing
+        pass
+
+
+def _finish_job(job_id, returncode, output_dir):
+    """main.py exited (here or on the remote worker): the job's final status
+    and result, from the exit code and what is on disk."""
+    if returncode == 0:
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['logs'].append("Process finished successfully.")
+
+        # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
+        # (see _archive_managed_job), so skip the redundant/paid AWS upload.
+        if not BILLING_ENABLED:
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
+
+        # Find result JSON
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            # Backward-compat rescue if outputs were written to OUTPUT_DIR root
+            if _relocate_root_job_artifacts(job_id, output_dir):
+                json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if json_files:
+            target_json = json_files[0]
+            with open(target_json, 'r') as f:
+                data = json.load(f)
+
+            # Enhance result with video URLs
+            base_name = os.path.basename(target_json).replace('_metadata.json', '')
+            clips = data.get('shorts', [])
+            cost_analysis = data.get('cost_analysis')
+
+            rendered, missing = _clips_actually_rendered(
+                job_id, output_dir, base_name, clips)
+            if not rendered:
+                # Nothing to hand over: fail the job so _settle_reservation
+                # releases the minutes instead of committing them.
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['logs'].append(
+                    "No clips could be rendered from this video.")
+            else:
+                if missing:
+                    jobs[job_id]['logs'].append(
+                        f"⚠️ {missing} of {len(clips)} clips failed to render.")
+                jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
+        else:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['logs'].append("No metadata file generated.")
+    else:
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
+
+
+async def _run_main(job_id, cmd, env, tick=None):
+    """Run a main.py command of ``job_id`` to its end and return its exit
+    code: output lines into the job's log, the manifest heartbeated, ``tick``
+    called every couple of seconds. Cancelled (the server is stopping): the
+    child is killed so it cannot keep writing into the job dir while the next
+    instance resumes the same job."""
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, # Merge stderr to stdout
+        env=env,
+        cwd=os.getcwd(),
+        preexec_fn=_lower_priority,
+    )
+    # We need to capture logs in a thread because Popen isn't async
+    t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
+    t_log.daemon = True
+    t_log.start()
+
+    last_heartbeat = time.time()
+    while process.poll() is None:
+        try:
+            await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            raise
+        if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
+            _touch_manifest(job_id)
+            last_heartbeat = time.time()
+        if tick is not None:
+            tick()
+    # The exit code can be read before the reader thread saw the last lines
+    # (SOURCE_READY is printed right before the exit).
+    await asyncio.to_thread(t_log.join, 5)
+    return process.returncode
+
+
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
+    if job_id in _remote_jobs:
+        return await _run_job_remote(job_id, job_data)
 
     cmd = job_data['cmd']
     env = _job_encode_env(job_data['env'])
@@ -3160,138 +4775,203 @@ async def run_job(job_id, job_data):
         # The daily paid-proxy budget ran out while this job was queued.
         env.pop("PROXY_URL", None)
     output_dir = job_data['output_dir']
-    
+
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
-    
+
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, # Merge stderr to stdout
-            env=env,
-            cwd=os.getcwd(),
-            preexec_fn=_lower_priority,
-        )
-        
-        # We need to capture logs in a thread because Popen isn't async
-        t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
-        t_log.daemon = True
-        t_log.start()
-        
-        # Async wait for process with incremental updates
-        start_wait = time.time()
-        last_heartbeat = time.time()
-        while process.poll() is None:
-            try:
-                await asyncio.sleep(2)
-            except asyncio.CancelledError:
-                # Shutting down: stop the child so it cannot keep writing into
-                # the job dir while the next instance resumes the same job.
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-                raise
-            if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
-                _touch_manifest(job_id)
-                last_heartbeat = time.time()
-            
-            # Check for partial results every 2 seconds
-            # Look for metadata file
-            try:
-                json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-                if json_files:
-                    target_json = json_files[0]
-                    # Read metadata (it might be being written to, so simple try/except or just read)
-                    # Use a lock or just robust read? json.load might fail if file is partial.
-                    # Usually main.py writes it once at start (based on my review).
-                    if os.path.getsize(target_json) > 0:
-                        with open(target_json, 'r') as f:
-                            data = json.load(f)
-                            
-                        base_name = os.path.basename(target_json).replace('_metadata.json', '')
-                        clips = data.get('shorts', [])
-                        cost_analysis = data.get('cost_analysis')
-                        
-                        # Check which clips actually exist on disk
-                        # Only clips main.py has announced as finished. It names
-                        # the file itself, so a clip shows up WITH its hook and
-                        # captions instead of as the bare reframe, and it is never
-                        # served while ffmpeg is still writing it. A clip whose
-                        # marker never arrives (it failed) simply stays hidden
-                        # until the job ends and the result is rebuilt from disk.
-                        ready_files = (jobs.get(job_id) or {}).get('ready_files') or {}
-                        ready_clips = []
-                        for i, clip in enumerate(clips):
-                             clip_filename = ready_files.get(i)
-                             if not clip_filename:
-                                 continue
-                             clip_path = os.path.join(output_dir, clip_filename)
-                             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                                 clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                                 ready_clips.append(clip)
-                        
-                        if ready_clips:
-                             jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
-            except Exception as e:
-                # Ignore read errors during processing
-                pass
-
-        returncode = process.returncode
-        
-        if returncode == 0:
-            jobs[job_id]['status'] = 'completed'
-            jobs[job_id]['logs'].append("Process finished successfully.")
-            
-            # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
-            # (see _archive_managed_job), so skip the redundant/paid AWS upload.
-            if not BILLING_ENABLED:
-                loop = asyncio.get_event_loop()
-                loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-            
-            # Find result JSON
-            json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-            if not json_files:
-                # Backward-compat rescue if outputs were written to OUTPUT_DIR root
-                if _relocate_root_job_artifacts(job_id, output_dir):
-                    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-            if json_files:
-                target_json = json_files[0] 
-                with open(target_json, 'r') as f:
-                    data = json.load(f)
-                
-                # Enhance result with video URLs
-                base_name = os.path.basename(target_json).replace('_metadata.json', '')
-                clips = data.get('shorts', [])
-                cost_analysis = data.get('cost_analysis')
-
-                rendered, missing = _clips_actually_rendered(
-                    job_id, output_dir, base_name, clips)
-                if not rendered:
-                    # Nothing to hand over: fail the job so _settle_reservation
-                    # releases the minutes instead of committing them.
-                    jobs[job_id]['status'] = 'failed'
-                    jobs[job_id]['logs'].append(
-                        "No clips could be rendered from this video.")
-                else:
-                    if missing:
-                        jobs[job_id]['logs'].append(
-                            f"⚠️ {missing} of {len(clips)} clips failed to render.")
-                    jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
-            else:
-                 jobs[job_id]['status'] = 'failed'
-                 jobs[job_id]['logs'].append("No metadata file generated.")
-        else:
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
-            
+        returncode = await _run_main(
+            job_id, cmd, env, tick=lambda: _refresh_partial_result(job_id, output_dir))
+        _finish_job(job_id, returncode, output_dir)
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
+
+
+# --- A job rendered by the remote worker -------------------------------------
+REMOTE_LOST_LOG = "Execution error: the remote worker stopped answering (killed)."
+
+
+def _server_gemini_key():
+    """The model key this server gives its own jobs, or None."""
+    try:
+        if BILLING_ENABLED:
+            return managed_keys.gemini_key()
+    except Exception:
+        return None
+    return os.environ.get("GEMINI_API_KEY") or None
+
+
+def _remote_eligible(job_id, priority) -> bool:
+    """Whether a queued entry may go to the remote worker: a free job that
+    never failed here, whose command the worker can repeat, and that uses the
+    server's own model key (a caller's key never leaves this host)."""
+    job = jobs.get(job_id)
+    if not job or job.get('status') != 'queued' or job.get('env') is None:
+        return False
+    if priority < _queue_mode.FREE_PRIORITY or job.get('auto_retries'):
+        return False
+    if job_id in _running_jobs or job_id in _admitting:
+        return False
+    parsed = remote_worker.worker_args(job.get('cmd'))
+    if parsed is None:
+        return False
+    if "twitch.tv" in parsed[0].lower():
+        return False             # its viewer-clip signal needs this host's keys
+    key = job['env'].get("GEMINI_API_KEY")
+    if not key or key != _server_gemini_key():
+        return False
+    return os.path.exists(_manifest_path(job_id))
+
+
+def _claim_remote_job(worker):
+    """Hand the next eligible queued job to the remote worker, or None.
+    ``(job_id, claim)``. Loop thread only: it edits the heap.
+
+    Only while a job is already waiting for a GPU slot: with room on the card
+    the job runs here, where it is faster."""
+    if not _remote_enabled() or _draining or _stopping:
+        return None
+    if len(_remote_jobs) >= REMOTE_WORKER_SLOTS or not _admitting:
+        return None
+    if time.time() < _remote_breaker["until"]:
+        return None
+    if time.gmtime().tm_min in REMOTE_QUIET_MINUTES:
+        return None
+    heap = job_queue._queue
+    for entry in sorted(heap):
+        prio, _key, job_id = entry
+        if not _remote_eligible(job_id, prio):
+            continue
+        heap.remove(entry)
+        heapq.heapify(heap)
+        _queue_changed()
+        job = jobs[job_id]
+        if os.path.exists(_expired_marker(job_id)):
+            # The other instance of a deploy ended it as starved a moment ago.
+            job_queue.task_done()
+            job['status'] = 'failed'
+            job['queue_expired'] = True
+            try:
+                with open(_expired_marker(job_id)) as f:
+                    kind = f.read()
+            except OSError:
+                kind = ""
+            job['logs'].append(_expired_log(kind))
+            continue
+        if prio >= _queue_mode.SLOW_PRIORITY and _queue_mode.brake_active():
+            _apply_brake_clips(job)
+        _running_jobs.add(job_id)
+        _remote_jobs.add(job_id)
+        job['run_started'] = time.time()
+        _touch_manifest(job_id, started=True)
+        claim = remote_worker.begin(job['output_dir'], worker)
+        print(f"🛰️ Job {job_id} goes to the remote worker {str(worker)[:40]!r}.")
+        asyncio.create_task(run_job_wrapper(job_id))
+        return job_id, claim
+    return None
+
+
+async def _run_job_remote(job_id, job_data):
+    """A job whose main.py runs on the remote worker. This host fetches the
+    source (download and cut, ``main.py --prepare-only``: the worker has no
+    proxy or cookie), publishes the command, then follows the files the worker
+    sends into the job dir exactly as it follows a subprocess. A worker that
+    goes quiet fails the job as a transient error, so it is retried here."""
+    cmd = list(job_data['cmd'])
+    output_dir = job_data['output_dir']
+    jobs[job_id]['status'] = 'processing'
+    jobs[job_id]['logs'].append("Job started by worker.")
+    handed = False               # the worker was given the job (not just a claim)
+    log_mark = len(job_data['logs'])
+    try:
+        parsed = remote_worker.worker_args(cmd)
+        env = dict(job_data['env'])
+        if await _paid_proxy_budget_exceeded():
+            env.pop("PROXY_URL", None)
+        jobs[job_id].pop('remote_source', None)
+        returncode = await _run_main(job_id, cmd + ["--prepare-only"], env)
+        source = jobs[job_id].get('remote_source')
+        if returncode != 0 or not source or parsed is None:
+            _finish_job(job_id, returncode or 1, output_dir)
+            return
+        options = remote_worker.job_options(job_data['env'], os.environ)
+        # The worker encodes the hooked-only picture itself: the lazy path
+        # leaves an encode recipe next to the clip, and a recipe is something
+        # this host runs later, so it never comes from another machine.
+        options["HOOK_LAZY"] = "0"
+        if job_data['env'].get("WATERMARK") == "1":
+            # Free plan: the mark is this host's to set, and it is set before
+            # the worker can send anything, so /videos refuses the clean
+            # deliverables from the first file on.
+            watermarked.mark_job(output_dir)
+        if not remote_worker.set_ready(output_dir, source, parsed[1], options):
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['logs'].append(REMOTE_LOST_LOG)
+            return
+        remote_worker.touch_seen(output_dir)
+        handed = True
+
+        offset = 0
+        last_heartbeat = time.time()
+        ready_at = time.time()
+        returncode = None
+        while returncode is None:
+            await asyncio.sleep(2)
+            if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
+                _touch_manifest(job_id)
+                last_heartbeat = time.time()
+            done = remote_worker.read_done(output_dir)
+            lines, offset = remote_worker.read_log(output_dir, offset)
+            for line in lines:
+                _handle_job_line(job_id, line, remote=True)
+            _refresh_partial_result(job_id, output_dir)
+            if done is not None:
+                returncode = done
+            elif not remote_worker.is_remote(output_dir):
+                returncode = -15            # the claim was dropped under us
+            elif (time.time() - remote_worker.last_seen(output_dir) > REMOTE_LEASE_SECONDS
+                  or time.time() - ready_at > REMOTE_MAX_SECONDS):
+                print(f"🛰️ Remote worker went quiet or too slow on {job_id}; "
+                      f"taking the job back.")
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['logs'].append(REMOTE_LOST_LOG)
+                return
+        _finish_job(job_id, returncode, output_dir)
+        if (returncode == 0 and remote_worker.source_is_url(cmd)
+                and "--keep-original" not in cmd):
+            with suppress(OSError):
+                os.remove(source)
+    except Exception as e:
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
+    finally:
+        # Whatever happened, the worker's claim ends here, and unless the job
+        # completed so does everything the worker uploaded: the retry on this
+        # host starts from this host's files. On a cancel (the server is
+        # stopping) it all stays: the next instance clears it on resume.
+        ok = job_data.get('status') == 'completed'
+        if ok or not _stopping:
+            # A job that completed is done with its worker even while this
+            # instance is being stopped: no claim may outlive the job.
+            remote_worker.clear(output_dir, purge=not ok)
+            if handed:
+                _remote_outcome(ok)
+            if not ok:
+                # What the worker printed is not this host's diagnosis: the
+                # run that follows here writes the log the user, the retry
+                # rules and the alerts read.
+                job_data['remote_failed'] = True
+                logs = job_data['logs']
+                del logs[log_mark:]
+                times = getattr(logs, 'times', None)
+                if times is not None:
+                    del times[log_mark:]
+                logs.append(REMOTE_LOST_LOG)
+
 
 @app.get("/health")
 async def health():
@@ -3312,6 +4992,196 @@ async def health_ready():
         return JSONResponse({"status": "stopping"}, status_code=503)
     return {"status": "ready"}
 
+# --- Remote worker endpoints (worker.py calls them; nothing else does) --------
+# Bearer REMOTE_WORKER_TOKEN, and a per-job claim id for everything after the
+# claim. Every refusal is a 404 (the feature may as well not exist) except a
+# claim that is no longer the job's, which is 410: the worker drops the job.
+# The handlers only read and write the job directory (remote_worker.py), so
+# either container of a deploy can answer.
+def _worker_auth(request: Request):
+    if not _remote_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    header = request.headers.get("authorization") or ""
+    token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+    if not token or not hmac.compare_digest(token.encode(), REMOTE_WORKER_TOKEN.encode()):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _worker_job(request: Request, job_id: str):
+    """``(job dir, claim record)`` of a job this worker holds."""
+    _worker_auth(request)
+    try:
+        ok = str(uuid.UUID(job_id)) == job_id
+    except (ValueError, AttributeError, TypeError):
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=404, detail="Not found")
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    data = remote_worker.valid(job_dir, request.headers.get("x-worker-claim") or "")
+    if data is None:
+        raise HTTPException(status_code=410, detail="This job is no longer yours.")
+    return job_dir, data
+
+
+_WORKER_BODY_MAX = 1024 * 1024
+
+
+async def _worker_body(request: Request) -> dict:
+    """The small JSON body of a worker call, read with a hard size limit."""
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > _WORKER_BODY_MAX:
+        raise HTTPException(status_code=413, detail="Body too large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > _WORKER_BODY_MAX:
+            raise HTTPException(status_code=413, detail="Body too large")
+    try:
+        body = json.loads(bytes(raw) or b"{}")
+    except ValueError:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+@app.post("/internal/worker/claim")
+async def worker_claim(request: Request):
+    _worker_auth(request)
+    body = await _worker_body(request)
+    claimed = _claim_remote_job(str(body.get("worker") or "worker"))
+    if claimed is None:
+        return JSONResponse({"job_id": None})
+    return {"job_id": claimed[0], "claim": claimed[1]}
+
+
+@app.get("/internal/worker/jobs/{job_id}")
+async def worker_job(job_id: str, request: Request):
+    job_dir, data = _worker_job(request, job_id)
+    remote_worker.touch_seen(job_dir)
+    if data.get("state") != remote_worker.READY:
+        return {"state": remote_worker.PREPARING}
+    return {"state": remote_worker.READY, "source": data.get("source"),
+            "source_size": data.get("source_size"), "args": data.get("args") or [],
+            "env": data.get("env") or {}}
+
+
+@app.get("/internal/worker/jobs/{job_id}/source")
+async def worker_source(job_id: str, request: Request):
+    job_dir, data = _worker_job(request, job_id)
+    source = data.get("source") if data.get("state") == remote_worker.READY else None
+    real = os.path.realpath(source) if source else ""
+    roots = [os.path.realpath(job_dir), os.path.realpath(UPLOAD_DIR)]
+    if not real or not any(real.startswith(r + os.sep) for r in roots) or not os.path.isfile(real):
+        raise HTTPException(status_code=404, detail="Not found")
+    remote_worker.touch_seen(job_dir)
+    return StreamingResponse(_source_chunks(real, job_dir), media_type="application/octet-stream",
+                             headers={"Content-Length": str(os.path.getsize(real))})
+
+
+SOURCE_CHUNK = 1024 * 1024
+# REMOTE_SOURCE_MBPS is for all transfers together: when a quiet window ends,
+# up to REMOTE_WORKER_SLOTS sources leave at once for the same link.
+_source_bucket = {"free_at": 0.0}
+_source_lock = threading.Lock()
+
+
+def _source_turn(nbytes) -> float:
+    """Seconds this chunk's sender sleeps so the sum stays under the cap."""
+    with _source_lock:
+        now = time.time()
+        start = max(now, _source_bucket["free_at"])
+        _source_bucket["free_at"] = start + nbytes * 8 / (REMOTE_SOURCE_MBPS * 1e6)
+        return max(0.0, _source_bucket["free_at"] - now)
+SOURCE_SEEN_EVERY = 10           # seconds between lease touches while sending
+
+
+def _source_chunks(path, job_dir):
+    """The source file in chunks, touching the worker's lease while it is sent.
+
+    The worker makes no other call during the download, and a source of
+    ~1 GB sent from a busy host took more than REMOTE_LEASE_SECONDS (16-nov):
+    the job was taken back mid-transfer, four of them tripped the breaker and
+    the worker sat idle while this host was the one out of CPU. A sync
+    generator: Starlette reads it in a thread, off the event loop."""
+    last = time.time()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(SOURCE_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+            if REMOTE_SOURCE_MBPS:
+                time.sleep(_source_turn(len(chunk)))
+            if time.time() - last >= SOURCE_SEEN_EVERY:
+                remote_worker.touch_seen(job_dir)
+                last = time.time()
+    remote_worker.touch_seen(job_dir)
+
+
+@app.post("/internal/worker/jobs/{job_id}/log")
+async def worker_log(job_id: str, request: Request):
+    job_dir, _data = _worker_job(request, job_id)
+    lines = (await _worker_body(request)).get("lines")
+    await asyncio.to_thread(remote_worker.append_log, job_dir,
+                            lines if isinstance(lines, list) else [])
+    return {"ok": True}
+
+
+@app.put("/internal/worker/jobs/{job_id}/file")
+async def worker_file(job_id: str, request: Request):
+    """One chunk of an output file (``name``), appended at ``offset``.
+    ``size`` on the last chunk: the file is complete and moves into the job
+    dir. Only a job that is rendering takes files, within its budget."""
+    job_dir, data = _worker_job(request, job_id)
+    q = request.query_params
+    name = q.get("name") or ""
+    try:
+        offset = max(0, int(q.get("offset") or 0))
+        size = int(q["size"]) if q.get("size") is not None else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="offset and size are numbers")
+    if data.get("state") != remote_worker.READY:
+        raise HTTPException(status_code=409, detail="The job is not rendering yet.")
+    file_max, job_max = REMOTE_MAX_FILE_MB * 1024 * 1024, REMOTE_MAX_JOB_MB * 1024 * 1024
+    written = 0
+    try:
+        # One upload request per job at a time (both containers of a deploy):
+        # the room granted below is then really this request's.
+        with remote_worker.upload_lock(job_dir):
+            rel, tmp, room = remote_worker.open_upload(job_dir, name, offset, file_max, job_max)
+            with open(tmp, "ab") as f:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > room:
+                        raise remote_worker.UploadError(413, "file too large")
+                    f.write(chunk)
+            remote_worker.touch_seen(job_dir)
+            if size is not None:
+                remote_worker.finish_upload(
+                    job_dir, rel, size, request.headers.get("x-worker-claim") or "",
+                    file_max, job_max)
+    except remote_worker.UploadError as e:
+        if e.status == 413:
+            remote_worker.discard_upload(job_dir, name)
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return {"ok": True, "received": offset + written}
+
+
+@app.post("/internal/worker/jobs/{job_id}/done")
+async def worker_done(job_id: str, request: Request):
+    job_dir, data = _worker_job(request, job_id)
+    if data.get("state") != remote_worker.READY:
+        raise HTTPException(status_code=409, detail="The job is not rendering yet.")
+    try:
+        returncode = int((await _worker_body(request))["returncode"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="returncode required")
+    remote_worker.mark_done(job_dir, returncode)
+    return {"ok": True}
+
+
 @app.get("/api/config")
 async def get_config():
     return {
@@ -3325,7 +5195,18 @@ async def get_config():
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
-    """Run quality_probe.py in a worker thread; {} on any failure (fail-open)."""
+    """What the source offers ({max_height, duration, ...}); {} on any failure
+    (fail-open). The metering probe a moment ago already asked YouTube for
+    this very video: its answer is reused, so a submission costs the account
+    one request here instead of two. Otherwise quality_probe.py runs in a
+    worker thread."""
+    try:
+        facts = _metering.probe_facts(url) if BILLING_ENABLED else None
+    except Exception:
+        facts = None
+    if facts:
+        return facts
+
     def _run():
         try:
             proc = subprocess.run(
@@ -3393,6 +5274,24 @@ async def _drop_unstarted_job(reservation_id, job_output_dir):
         except Exception as e:
             print(f"⚠️ Could not release reservation {reservation_id}: {e}")
     shutil.rmtree(job_output_dir, ignore_errors=True)
+
+
+MAX_UPLOAD_NAME_BYTES = 120
+
+
+def _clamp_upload_name(name: str, max_bytes: int = MAX_UPLOAD_NAME_BYTES) -> str:
+    """Shorten a client-supplied file name so "<id>_<name>" fits the 255-byte
+    limit most filesystems put on a name. The limit is in BYTES, not characters,
+    and emoji or math-alphabet letters take 4 each. The extension is kept and
+    the cut never lands inside a multi-byte character."""
+    if len(name.encode("utf-8")) <= max_bytes:
+        return name
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode("utf-8")) > 16:
+        stem, ext = name, ""
+    room = max_bytes - len(ext.encode("utf-8"))
+    stem = stem.encode("utf-8")[:room].decode("utf-8", "ignore").rstrip()
+    return (stem or "upload") + ext
 
 
 def _media_duration_seconds(path: str) -> float:
@@ -3469,7 +5368,7 @@ async def create_upload(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    filename = os.path.basename(str((body or {}).get("filename") or "video.mp4")) or "video.mp4"
+    filename = _clamp_upload_name(os.path.basename(str((body or {}).get("filename") or "video.mp4")) or "video.mp4")
     if BILLING_ENABLED:
         # Each slot can hold MAX_FILE_SIZE_MB on disk until it expires.
         now = time.time()
@@ -3608,6 +5507,10 @@ class EstimateRequest(BaseModel):
     seconds: Optional[float] = None  # a local file: the browser read its duration
 
 
+
+# The cost line under the link box waits at most this long for the probe.
+ESTIMATE_PROBE_TIMEOUT = _int_env("ESTIMATE_PROBE_TIMEOUT", 20)
+
 @app.post("/api/process/estimate")
 async def process_estimate(req: EstimateRequest, request: Request):
     """Cost line for the dashboard: what this source would cost before it runs.
@@ -3632,8 +5535,12 @@ async def process_estimate(req: EstimateRequest, request: Request):
             _check_probe_rate(f"estimate:{user.id}")
             loop = asyncio.get_event_loop()
             try:
-                minutes = await loop.run_in_executor(
-                    None, functools.partial(_metering.probe_url_minutes, url, allow_paid=False))
+                minutes = await asyncio.wait_for(
+                    _metering.run_probe(url, allow_paid=False), ESTIMATE_PROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                # Only the cost line waits on it: without a number the page
+                # says nothing, and the submit probes for itself.
+                return {"billing": True, "outcome": None}
             except Exception as e:
                 from yt_clients import NotASingleVideo
                 if isinstance(e, NotASingleVideo):
@@ -3876,7 +5783,7 @@ async def process_endpoint(
         if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
             shutil.rmtree(job_output_dir, ignore_errors=True)
             _reject_short_source(src_duration)
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{os.path.basename(src)}")
+        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{_clamp_upload_name(os.path.basename(src))}")
         try:
             os.link(src, input_path)
         except OSError:
@@ -3905,7 +5812,7 @@ async def process_endpoint(
         # Save uploaded file with size limit check.
         # basename() strips any path components from the client-supplied
         # filename so a name like "../../main.py" can't escape UPLOAD_DIR.
-        safe_name = os.path.basename(file.filename or "upload") or "upload"
+        safe_name = _clamp_upload_name(os.path.basename(file.filename or "upload") or "upload")
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
 
         # Read file in chunks to check size
@@ -4019,6 +5926,12 @@ async def process_endpoint(
         # API callers poll or get the webhook; the clips-ready email is for
         # people who left the dashboard tab.
         'via_api_key': request_uses_api_key(request),
+        # Free queue lane (cloud/queue_mode.py) and the submission time that
+        # orders the queue; both travel in the resume manifest.
+        'lane': getattr(request.state, "queue_lane", _queue_mode.NORMAL),
+        'submitted_at': _arrival_now(),
+        # A free-plan job paid with top-up minutes queues with the paid plans.
+        'topup': bool(getattr(request.state, "queue_topup", False)),
     }
 
     # Persist the owner so recovered jobs keep their multi-tenant guard after a
@@ -4038,9 +5951,14 @@ async def process_endpoint(
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
                            base_url=api_base, partial=partial,
                            source_cap_minutes=source_cap, skip_statics=skip_statics,
-                           via_api_key=jobs[job_id]['via_api_key'])
+                           via_api_key=jobs[job_id]['via_api_key'],
+                           lane=jobs[job_id]['lane'], submitted_at=jobs[job_id]['submitted_at'],
+                           topup=jobs[job_id]['topup'])
 
     _enqueue_job(job_id, priority)
+    if _saturation_on():
+        print(f"[lane] job={job_id} lane={jobs[job_id]['lane']} priority={priority} "
+              f"topup={int(jobs[job_id]['topup'])}")
 
     return {"job_id": job_id, "status": "queued", "partial": partial,
             "first_video": bool(getattr(request.state, "first_video", False))}
@@ -4057,6 +5975,20 @@ def _job_view_from_disk(job_id):
     if not os.path.isdir(job_path):
         return None
     m = _read_manifest(job_id)
+    if m is None and os.path.exists(os.path.join(job_path, _EXPIRED_MARKER)):
+        owner = None
+        try:
+            with open(os.path.join(job_path, ".owner")) as f:
+                owner = f.read().strip() or None
+        except OSError:
+            pass
+        try:
+            with open(os.path.join(job_path, _EXPIRED_MARKER)) as f:
+                kind = f.read()
+        except OSError:
+            kind = ""
+        return {'status': 'failed', 'logs': _TimedLog([_expired_log(kind)]),
+                'user_id': owner, 'result': None, 'queue_expired': True}
     if m is None:
         if glob.glob(os.path.join(job_path, "*_metadata.json")):
             _recover_jobs_from_disk()
@@ -4065,7 +5997,8 @@ def _job_view_from_disk(job_id):
     alive = time.time() - float(m.get("heartbeat") or 0) < HEARTBEAT_STALE_AFTER
     owner = m.get("user_id")
     return {
-        'status': 'processing' if alive else 'queued',
+        # Rendered, delivery pending: the next instance finishes it, no queue.
+        'status': 'processing' if alive or m.get("stage") == "delivering" else 'queued',
         'logs': _TimedLog(["♻️ The server was updated; your video continues on the new instance."]),
         'user_id': (int(owner) if isinstance(owner, str) and owner.isdigit() else owner),
         'result': None,
@@ -4098,6 +6031,10 @@ def _presented_status(job_id, job):
         m = _read_manifest(job_id)
         if m and _manifest_busy_elsewhere(m):
             return 'processing'
+    if job.get('delivering'):
+        # main.py is done but the clips are not archived/unmarked yet: not
+        # finished for the user until the delivery says so.
+        return 'processing'
     return job['status']
 
 
@@ -6225,7 +8162,7 @@ class SocialPostRequest(BaseModel):
     clip_index: int
     api_key: Optional[str] = None  # BYOK; ignored for managed users
     user_id: Optional[str] = None  # BYOK profile; ignored for managed users
-    platforms: List[str] # ["tiktok", "instagram", "youtube"]
+    platforms: List[str]  # social_platforms.PLATFORMS
     # Optional overrides if frontend wants to edit them
     title: Optional[str] = None
     description: Optional[str] = None
@@ -6244,18 +8181,18 @@ def _post_video_blocking(url, headers, data, file_path, filename, timeout):
         return client.post(url, headers=headers, data=data, files=files)
 
 
-# YouTube refuses a title over 100 characters; the Gemini title is not bounded.
-YOUTUBE_TITLE_MAX = 100
+import social_platforms
+from social_platforms import YOUTUBE_TITLE_MAX, youtube_title  # noqa: F401  (re-exported)
 
 
-def youtube_title(title) -> str:
-    """``title`` cut to YouTube's limit, on a word boundary when there is one."""
-    t = " ".join(str(title or "").split())
-    if len(t) <= YOUTUBE_TITLE_MAX:
-        return t
-    cut = t[:YOUTUBE_TITLE_MAX]
-    space = cut.rfind(" ")
-    return (cut[:space] if space >= YOUTUBE_TITLE_MAX // 2 else cut).rstrip(" ,.;:-")
+def _checked_platforms(platforms) -> List[str]:
+    """The request's platforms, or a 400 naming the ones OpenShorts does not post to."""
+    bad = social_platforms.unknown(platforms)
+    if bad or not platforms:
+        raise HTTPException(status_code=400, detail=(
+            f"Unsupported platform: {', '.join(map(str, bad))}. " if bad else "No platform chosen. ")
+            + f"Choose from {', '.join(social_platforms.PLATFORMS)}.")
+    return social_platforms.clean(platforms)
 
 
 # Async uploads started here, so the status proxy below only ever answers the
@@ -6317,6 +8254,7 @@ async def _check_social_post_rate(request):
 
 @app.post("/api/social/post")
 async def post_to_socials(req: SocialPostRequest, request: Request):
+    req.platforms = _checked_platforms(req.platforms)
     await _ensure_job_files(req.job_id, request)
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -6328,7 +8266,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
     post_user = resolve_post_profile(forced_profile, req.user_id)
 
-    job = jobs[req.job_id]
+    # The awaits above can let cleanup or an account delete drop the job.
+    job = jobs.get(req.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     await _assert_job_owner(request, job)
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
@@ -6339,7 +8280,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         if stale:
             print(f"[social-post-failed] request=none platform={','.join(stale)} "
                   f"status=reauth_required message='refused before upload: reconnect needed'")
-            names = ", ".join(p.capitalize() if p != "youtube" else "YouTube" for p in stale)
+            names = ", ".join(social_platforms.label(p) for p in stale)
             raise HTTPException(status_code=409, detail=(
                 f"Reconnect {names} first: its login has expired, so the post would "
                 "fail. Use \"connect socials\" and try again."))
@@ -6382,20 +8323,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
             if req.timezone:
                 data_payload["timezone"] = req.timezone
         
-        # Add Platform specifics
-        if "tiktok" in req.platforms:
-             data_payload["tiktok_title"] = final_description
-             data_payload["post_mode"] = TIKTOK_POST_MODE
-             
-        if "instagram" in req.platforms:
-             data_payload["instagram_title"] = final_description
-             data_payload["media_type"] = "REELS"
-
-        if "youtube" in req.platforms:
-             yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
-             data_payload["youtube_title"] = youtube_title(yt_title)
-             data_payload["youtube_description"] = final_description
-             data_payload["privacyStatus"] = "public"
+        data_payload.update(social_platforms.upload_fields(
+            req.platforms, title=final_title, description=final_description,
+            yt_title=req.title or clip.get('video_title_for_youtube_short', final_title),
+            tiktok_post_mode=TIKTOK_POST_MODE))
 
         # The upload is a blocking multipart POST of the whole clip (tens of
         # seconds for TikTok+YouTube). Run inline, it froze the event loop:
@@ -6437,7 +8368,7 @@ async def social_post_status(request_id: str, request: Request):
     upload_key, _ = await resolve_upload_post(request, None)
     if not upload_key:
         return {"status": "unknown"}
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with social_platforms.upload_post_client(20.0) as client:
         try:
             resp = await client.get("https://api.upload-post.com/api/uploadposts/status",
                                     headers={"Authorization": f"Apikey {upload_key}"},
@@ -6480,7 +8411,7 @@ def _log_post_failures(request_id, status, results):
         print(f"[social-post-failed] request={request_id} platform={r.get('platform')} "
               f"status={status} message={msg!r}")
 
-SOCIAL_PLATFORMS = ("tiktok", "instagram", "youtube")
+SOCIAL_PLATFORMS = social_platforms.PLATFORMS
 
 
 async def _managed_social_user(request, api_key, profile):
@@ -6492,7 +8423,7 @@ async def _managed_social_user(request, api_key, profile):
         user = await _user_from_request(request)
         name = cloud.social_profiles.profile_username_for(user.id)
         return {"profiles": [{"username": name, "connected": []}]}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         resp = await client.get(f"https://api.upload-post.com/api/uploadposts/users/{profile}",
                                 headers={"Authorization": f"Apikey {api_key}"})
     if resp.status_code == 404:
@@ -6523,7 +8454,7 @@ async def get_social_user(request: Request):
     print(f"🔍 Fetching User ID from: {url}")
     headers = {"Authorization": f"Apikey {api_key}"}
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         try:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
@@ -6549,7 +8480,7 @@ async def get_social_user(request: Request):
                              socials = p.get('social_accounts', {})
                              connected = []
                              # Check typical platforms
-                             for platform in ['tiktok', 'instagram', 'youtube']:
+                             for platform in SOCIAL_PLATFORMS:
                                  account_info = socials.get(platform)
                                  # If it's a dict and typically has data, or just not empty string
                                  if isinstance(account_info, dict):
@@ -6614,7 +8545,7 @@ async def _social_analytics_auth(request: Request, byok_profile: Optional[str]):
 
 async def _upload_post_get(api_key: str, url: str, params: dict):
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with social_platforms.upload_post_client(60.0) as client:
         resp = await client.get(url, headers=headers, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Vendor API Error: {resp.text}")
@@ -6818,7 +8749,7 @@ async def social_cancel_scheduled(job_id: str, request: Request, user: Optional[
         # 404 rather than 403: never confirm that someone else's job exists.
         raise HTTPException(status_code=404, detail="Scheduled post not found")
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         resp = await client.delete(
             f"https://api.upload-post.com/api/uploadposts/schedule/{job_id}",
             headers=headers)
@@ -6872,8 +8803,7 @@ async def _probe_thumbnail_url(request, url, user):
     paid_allowed = not await _paid_proxy_budget_exceeded()
     loop = asyncio.get_event_loop()
     try:
-        minutes = await loop.run_in_executor(
-            None, functools.partial(_metering.probe_url_minutes, url, allow_paid=paid_allowed))
+        minutes = await _metering.run_probe(url, allow_paid=paid_allowed)
     except Exception as e:
         from yt_clients import NotASingleVideo
         if isinstance(e, NotASingleVideo):
@@ -6929,7 +8859,7 @@ async def _save_thumbnail_upload(file, session_id):
     is refused (too big, unreadable or too long)."""
     # basename() stops a "../../x" filename from escaping UPLOAD_DIR; the
     # chunked read caps memory so a huge body can't OOM.
-    safe_name = os.path.basename(file.filename or "upload") or "upload"
+    safe_name = _clamp_upload_name(os.path.basename(file.filename or "upload") or "upload")
     video_path = os.path.join(UPLOAD_DIR, f"thumb_{session_id}_{safe_name}")
     size = 0
     limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -7850,6 +9780,7 @@ class SaaSPostRequest(BaseModel):
 @app.post("/api/saasshorts/post")
 async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
     """Post an AI Shorts video to social media via Upload-Post."""
+    req.platforms = _checked_platforms(req.platforms)
     if req.job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -7895,16 +9826,9 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
             if req.timezone:
                 data_payload["timezone"] = req.timezone
 
-        if "tiktok" in req.platforms:
-            data_payload["tiktok_title"] = final_description
-            data_payload["post_mode"] = TIKTOK_POST_MODE
-        if "instagram" in req.platforms:
-            data_payload["instagram_title"] = final_description
-            data_payload["media_type"] = "REELS"
-        if "youtube" in req.platforms:
-            data_payload["youtube_title"] = youtube_title(final_title)
-            data_payload["youtube_description"] = final_description
-            data_payload["privacyStatus"] = "public"
+        data_payload.update(social_platforms.upload_fields(
+            req.platforms, title=final_title, description=final_description,
+            tiktok_post_mode=TIKTOK_POST_MODE))
 
         filename = os.path.basename(file_path)
         print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")

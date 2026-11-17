@@ -68,7 +68,7 @@ const FAQ = [
   [
     'Is OpenShorts really free?',
     'Self-hosting is free under the MIT licence, with no watermark and no cap; OpenShorts Cloud has a free plan (your first video up to 60 minutes, then 20 minutes a month, watermarked) and paid plans from $12/month.' +
-      ' Self-hosted costs you hardware and time: on a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you supply your own Google Gemini key, whose free tier covers 1,500 requests a day. On OpenShorts Cloud an NVIDIA GPU clips that same video in about 50 seconds, the Gemini key is included, auto-posting to TikTok, Instagram and YouTube is already wired up, and your clips stay retrievable from any browser.',
+      ' Self-hosted costs you hardware and time: on a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you supply your own Google Gemini key, whose free tier covers 1,500 requests a day. On OpenShorts Cloud an NVIDIA GPU clips that same video in about 50 seconds, the Gemini key is included, paid plans post every clip to TikTok, Instagram, YouTube, Facebook, LinkedIn, Threads and Bluesky for you and Autopilot clips each new video on your channel on its own, and your clips stay retrievable from any browser.',
   ],
   [
     'Do the clips have a watermark?',
@@ -176,7 +176,7 @@ ${NAV_SCRIPT}
   <h1 style="${S.h1}">Free AI clip maker: long video in, viral shorts out</h1>
   <p style="${S.p};max-width:44rem;font-size:1.05rem">Paste a YouTube link or upload a podcast, stream or interview. The AI picks the 3 to 15 moments worth posting, reframes them to 9:16 around the people talking, and burns in the captions, ready for TikTok, Reels and Shorts in minutes. Prefer to run it yourself? It is <a href="/free-ai-clip-generator" style="${S.a}">free and open source</a>. Claude, ChatGPT and n8n can drive it too, over <a href="/mcp" style="${S.a}">MCP</a>.</p>
   ${HERO_FORM}
-  <p style="${S.muted};max-width:44rem">20,000+ accounts created &middot; 13,800+ videos clipped &middot; 3,100+ hours of video processed &middot; 6.1k GitHub stars.</p>
+  <p style="${S.muted};max-width:44rem">45,000+ accounts created &middot; 32,900+ videos clipped &middot; 8,300+ hours of video processed &middot; 7.5k GitHub stars.</p>
   <p style="${S.muted};max-width:44rem"><strong style="color:oklch(75% 0.11 150)">No credit card required.</strong> Your first video is free up to 60 minutes, then 20 free minutes every month. Paid plans from $12/month without a watermark. Prefer to run it yourself? <a style="${S.a}" href="https://github.com/mutonby/openshorts" rel="noopener">Self-host free on GitHub</a>.</p>
   <p style="${S.muted};max-width:44rem">Works with links from ${WORKS_WITH.map(link).join(' &middot; ')}.</p>
 </div></section>

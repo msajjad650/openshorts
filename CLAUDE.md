@@ -32,7 +32,7 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - `clip_selection.py`, `layout_picker.py`, `reframe_v2.py`, `split_layout.py`, `screencast_layout.py`, `camera_inset.py`: moment picking and layouts.
 - `editor.py` (Gemini FFmpeg effects), `hooks.py` (hook overlays), `subtitles.py` (SRT/ASS, burning), `translate.py` (ElevenLabs dubbing), `thumbnail.py`.
 - `mcp_server.py`, `mcp_stdio.py`: MCP over HTTP and stdio.
-- `cloud/`: auth, API keys, metering, billing, lifecycle emails, account erasure, autopilot, proxy ledger, alerts.
+- `cloud/`: auth, API keys, metering, billing, lifecycle emails, account erasure, autopilot, proxy ledger, alerts, queue watch.
 - `dashboard/src/App.jsx`: main React component. `dashboard/vite-plugin-seo.js` + `dashboard/seo/`: build-time SEO pages, sitemap, llms.txt. `dashboard/seo/data.js`: single source of truth for pricing/pipeline/competitor facts.
 
 ## Subsystem reference (read before touching)
@@ -44,9 +44,10 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - API endpoints, API keys, MCP, OAuth, webhooks → `docs/architecture/agent-access.md`
 - Autopilot → `docs/architecture/autopilot.md`
 - Free-plan watermark (served `wm_` copy, unmark on upgrade) → `docs/architecture/watermark.md`
-- Quota wall, free overflow, lifecycle emails, cancel flow, survey, GDPR erasure → `docs/architecture/billing-and-account.md`
+- Quota wall, free overflow, lifecycle emails, cancel flow, survey, GDPR erasure, support-ops API → `docs/architecture/billing-and-account.md`
 - Concurrency/VRAM, auto-retry, deploy handover and drain → `docs/architecture/jobs-and-deploys.md`
 - Download routing, yt-dlp clients, paid proxy ledger → `docs/architecture/proxy-routing.md`
+- Remote CPU worker (second host renders free jobs) → `docs/architecture/remote-worker.md`
 
 ## Hard rules
 
@@ -76,11 +77,14 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - Call `transcribe_backends.release_models()` after any ASR (job processes and in-API transcriptions alike). Size `MAX_CONCURRENT_JOBS` by free VRAM first.
 - `DRAIN_TIMEOUT_SECONDS` must stay below the deployment's (Coolify) stop grace period. The image must ship `curl` for the platform health check.
 - A drain-cancelled job keeps its manifest and reservation and is resumed, never marked failed or completed.
+- The remote worker gets job options and the source, never a credential, and writes only plain non-dot output files into its job's directory (`remote_worker.job_options`, `safe_relpath`). A remote job holds no GPU slot (`_local_running`); new per-job state it needs lives as files in the job dir, not in memory.
+- Whatever is read back from a job directory (recipes, metadata, sidecars, subtitles, log lines) is data from possibly another machine: numbers as numbers, text as text, never pasted into an ffmpeg filter graph, a path or markup. A filter string that is not a plain chain of `editor._ALLOWED_FILTERS` is not run.
 
 **Download proxies**
 - Route order is direct → static → paid (per-GB `PROXY_URL`). Never use the paid proxy for non-YouTube URLs, nor for failures another IP cannot fix (`static_failure_warrants_paid`).
 - The probe also carries `YOUTUBE_COOKIES`, like the download does; first attempt with cookies, second anonymous, on probe and download alike.
 - Keep the explicit `yt_clients.py` client list; never put `player_skip: webpage` back. `noplaylist` always; non-video URLs refused by an allowlist.
+- Every yt-dlp extraction that sends `YOUTUBE_COOKIES` takes its cookie file from a `yt_account.Session` (one of the configured accounts, `YOUTUBE_COOKIES_2`.. add more) and runs inside its `request()`, and none is sent while `yt_account.cooling_down()`: each account's budget is shared by every probe and download. A failure that is only the account limit is retried after the cooldown (`YT_ACCOUNT_LIMITED`), never reported as a broken video.
 - `DOWNLOAD_SKIP_STATICS` only when the probe saw every static bot-checked. `PAID_PROXY_DAILY_MB` is the hard daily ceiling. Never keep `PROXY_URL` in a local `.env`.
 
 **Agent access**
@@ -97,9 +101,11 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - Cancel and churn alerts carry the reason and rating, never the user's free text. Deletion reasons are a closed list.
 - `reserve_process_minutes` never reserves more than the balance, whatever the client asks; the source cut travels in the resume manifest.
 - Lifecycle/commercial emails go through `emails.send_commercial_email` (opt-out + unsubscribe headers), once per account per kind.
+- The support-ops API (`cloud/support_ops.py`, `/api/support-ops/v1`) is 404 unless its keys are set, never emails the customer, never calls Stripe and writes only the account in the path; every write is a dry run unless `dry_run: false` + ticket, and returns a `before` that `restore` can write back. A banned account (`users.ban_reason`) authenticates as nobody.
 
 **Public repo**
 - This repository is public: no hosts, IPs, server paths, production metrics, business figures or customer data in code, comments, docs or commit messages.
+- The free slow lane's countries (`FREE_SLOW_LANE_COUNTRIES`) live only in the deployment env: tests and docs use user-assigned codes (`XA`, `XB`), and no user-facing text names a country or region (`cloud/queue_mode.py`).
 
 ## CI: a green pipeline closes the task, not the push
 

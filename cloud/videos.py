@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select, delete
 
 from .config import settings, VIDEO_RETENTION_GRACE_DAYS, FREE_CLIP_RETENTION_DAYS
-from . import database, storage, metering
+from . import database, storage, metering, media_redirect
 from .models import UserVideo, Subscription, Project, User, ClipExpiryWarning
 from .auth import get_current_user_required
 
@@ -171,6 +171,7 @@ async def unmark_user_library(user_id, job_id=None) -> int:
                 except Exception as e:
                     print(f"⚠️  Local unmark failed for {proj.job_id}: {e}")
             done += 1
+        media_redirect.forget(proj.job_id)
     if done:
         print(f"🏷️  Watermark removed from {done} clip(s) of user {user_id} after upgrade.")
     return done
@@ -221,8 +222,9 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
         # one (captioned/recut): it is the editable master — the clip editor's
         # fast path and /api/subtitle re-styles cut from it, so a project
         # restored after a redeploy is only editable if it comes back too.
-        # Restore downloads every key under the job prefix, so no change is
-        # needed on that side; the free-retention purge deletes by prefix.
+        # Restore downloads every key under the job prefix (except the
+        # archived source, cloud/source_archive.py), so no change is needed on
+        # that side; the free-retention purge deletes by prefix.
         if base_name:
             clean = f"{base_name}_clip_{i + 1}.mp4"
             clean_path = os.path.join(output_dir, clean)
@@ -297,6 +299,7 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                     proj.metadata_r2_key = metadata_r2_key
                     proj.state = state
                     proj.size_bytes = total
+    media_redirect.forget(job_id)
     print(f"☁️  Archived {len(uploaded)} clip(s) to R2 for user {user_id}.")
 
 
@@ -376,6 +379,7 @@ async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filenam
             else:
                 s.add(UserVideo(user_id=user_id, job_id=job_id, clip_index=clip_index,
                                 r2_key=new_key, size_bytes=size))
+    media_redirect.forget(job_id)
     for superseded_key in superseded:
         if superseded_key == new_key:
             continue
@@ -644,6 +648,9 @@ async def _sweeper_loop():
             await purge_stale_deletion_records()
             from .evidence import purge_stale_events
             await purge_stale_events()
+            # Paid jobs' source videos past SOURCE_ARCHIVE_DAYS (once a day).
+            from .source_archive import purge_expired_sources
+            await purge_expired_sources()
         except asyncio.CancelledError:
             break
         except Exception as e:

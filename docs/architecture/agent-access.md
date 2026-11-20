@@ -13,8 +13,12 @@
 - `POST /api/social/post`: post to social media (async upload). Cloud posts
   through one managed Upload-Post account, one `os_<hex>` profile per user,
   created only by `/api/social/connect` (reads never create it). Capped at
-  `SOCIAL_POSTS_PER_HOUR` per user and `SOCIAL_POSTS_PER_DAY_FREE` on the free
-  plan (429 with the reason); thumbnail and SaaSShorts publishing count too.
+  `SOCIAL_POSTS_PER_HOUR` per user (429). Posting is part of the paid plans: a
+  free account gets `FREE_SOCIAL_POSTS` posts in total (zero-minute
+  `social_post` ledger rows; a post that fails gives its try back), then a 402
+  `post_requires_plan` with an `upgrade_url`, and the response carries
+  `free_posts_left` while it has some. Thumbnail and SaaSShorts publishing
+  count too.
 - `POST /mcp`: MCP server (JSON-RPC), the pipeline as agent tools.
 - `POST/GET/DELETE /api/keys`: user API keys (cloud mode, session JWT only).
 - `DELETE /api/account`: erase the account and everything in it (GDPR art. 17).
@@ -110,6 +114,35 @@ MCP `video_url` / `download_url`, webhook `video_url`, and a per-clip
 working until `MEDIA_LEGACY_UNTIL` (links sent before signing existed).
 Self-host is open. The R2 library links are separate: public objects behind an
 unguessable key.
+
+**Archived clips are fetched from storage** (`cloud/media_redirect.py`,
+`app._media_redirect`). `/videos` is one process that also runs the queue, so
+once the guard and the authorization have passed, the owner's browser gets a
+307 to the archived copy instead of the bytes, and a purged job is no longer
+pulled back to this host to play one file. It happens only when:
+
+- the request is the browser's own GET for a player, an image or a link it
+  follows (`Sec-Fetch-Mode: no-cors` or `navigate`). An API client, a `HEAD`
+  and a script's `fetch` are served here as before: a fetch redirected across
+  two hosts reaches storage without an origin and is refused;
+- the caller is the owner (media token or credentials), also when the link
+  is signed: the dashboard plays a fresh job through the signed links of its
+  status, with the owner's cookie. A signed link by itself expires and a
+  storage link does not, so one is never traded for the other;
+- a `user_videos` row of that owner and job names exactly that file. The rows
+  are each clip's *served* file: on the free plan the marked copy, never the
+  clean twin that sits next to it in the bucket;
+- no re-archive of the job is in flight (`hold` / `forget` around
+  `_archive_clip_edit_bg`) and the local copy, if there is one, has the size
+  the row recorded. Some edits reuse a file name (`edited_<file>`,
+  `translated_<lang>_<file>`), so the link also carries the size and the
+  local file's time as `?v=`, or the edge cache would keep the old object.
+
+The dashboard's download button asks `GET /api/media-url?job_id=&filename=`
+(owner only, same rules, `{"url": null}` when this host has to serve it) and
+fetches from there. `MEDIA_REDIRECT=0` turns all of it off; it is also off
+without `R2_PUBLIC_BASE`, because the signed S3 endpoint is not one a browser
+can be sent to. Thumbnails are not archived, so `/thumbnails` is unchanged.
 
 Jobs sent with an `osk_` key (REST, MCP, OAuth clients) do not trigger the
 clips-ready email: the caller polls or gets the webhook. The job records

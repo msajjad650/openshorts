@@ -30,7 +30,7 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - `main.py`: core processing (transcription, scene detection, clip extraction, reframing). Runs as a child process per job.
 - `app.py`: FastAPI server, job queue, REST endpoints, deploy handover/drain.
 - `clip_selection.py`, `layout_picker.py`, `reframe_v2.py`, `split_layout.py`, `screencast_layout.py`, `camera_inset.py`: moment picking and layouts.
-- `editor.py` (Gemini FFmpeg effects), `hooks.py` (hook overlays), `subtitles.py` (SRT/ASS, burning), `translate.py` (ElevenLabs dubbing), `thumbnail.py`.
+- `editor.py` (Gemini FFmpeg effects), `pro_mode.py` (talking-head re-edit), `hooks.py` (hook overlays), `subtitles.py` (SRT/ASS, burning), `translate.py` (ElevenLabs dubbing), `thumbnail.py`.
 - `mcp_server.py`, `mcp_stdio.py`: MCP over HTTP and stdio.
 - `cloud/`: auth, API keys, metering, billing, lifecycle emails, account erasure, autopilot, proxy ledger, alerts, queue watch.
 - `dashboard/src/App.jsx`: main React component. `dashboard/vite-plugin-seo.js` + `dashboard/seo/`: build-time SEO pages, sitemap, llms.txt. `dashboard/seo/data.js`: single source of truth for pricing/pipeline/competitor facts.
@@ -41,13 +41,15 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - Layout picker, reframing modes, hook grounding → `docs/architecture/layouts-and-reframing.md`
 - Clip count, silent-footage fallback, local LLM → `docs/architecture/clip-selection.md`
 - Thumbnail Studio → `docs/architecture/thumbnails.md`
+- Pro mode (talking-head re-edit, per-clip switch) → `docs/architecture/pro-mode.md`
 - API endpoints, API keys, MCP, OAuth, webhooks → `docs/architecture/agent-access.md`
 - Autopilot → `docs/architecture/autopilot.md`
 - Free-plan watermark (served `wm_` copy, unmark on upgrade) → `docs/architecture/watermark.md`
-- Quota wall, free overflow, lifecycle emails, cancel flow, survey, GDPR erasure, support-ops API → `docs/architecture/billing-and-account.md`
+- Quota wall, free overflow, lifecycle emails, cancel flow, survey, GDPR erasure, paid-source archive, support-ops API → `docs/architecture/billing-and-account.md`
 - Concurrency/VRAM, auto-retry, deploy handover and drain → `docs/architecture/jobs-and-deploys.md`
 - Download routing, yt-dlp clients, paid proxy ledger → `docs/architecture/proxy-routing.md`
 - Remote CPU worker (second host renders free jobs) → `docs/architecture/remote-worker.md`
+- Multiprocess API (engine + front processes, status snapshots, shared cache epoch) → `docs/architecture/multiprocess-api.md`
 
 ## Hard rules
 
@@ -67,6 +69,7 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - SPLIT captions need ASS with `{\an5}` per word event on the seam; SRT cannot do per-stretch alignment. Preserve `layout_ranges` through recut (`layout_ranges.remap`).
 - Mouth activity is normalised per speaker before comparing (`normalise_activity`).
 - The reframe render runs in one GPU pass (`gpu_render` + `osrender/`) built from the scenes' own filtergraphs: a layout graph that `gpu_render.layers_from_graph` cannot read silently renders through ffmpeg, so keep new layouts to crop/scale/gblur/overlay/vstack/pad and run `tests/test_gpu_render_equivalence.py` on a GPU. After editing `osrender/src/kernels.cu`, regenerate `kernels.ptx` (see `osrender/README.md`).
+- Pro mode (`pro_mode.py`) renders frame by frame on the CPU: always through `pro_mode.run` (own process, host slot), never inside the API or a job thread, and `PRO_MODE=auto` stays opt-in. The pro file is a `recut_` with its `recipe`; never a new filename prefix.
 - Canonical files are always clean; the free-plan mark exists only on the served `wm_` copy (`main.mark_delivery` / `app._deliver`). While a job has `.marked`, `/videos` refuses its clean deliverables.
 
 **Clip selection**
@@ -76,30 +79,36 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 **Jobs, GPU, deploys**
 - Call `transcribe_backends.release_models()` after any ASR (job processes and in-API transcriptions alike). Size `MAX_CONCURRENT_JOBS` by free VRAM first.
 - `DRAIN_TIMEOUT_SECONDS` must stay below the deployment's (Coolify) stop grace period. The image must ship `curl` for the platform health check.
+- With `API_FRONT_WORKERS` > 0 the API is one engine (`app.py`, the only process with jobs/queue in memory) plus N front processes (`front.py`). A front serves only `front_proxy.serves_locally` routes, which must reach none of `app.py`'s module-level state (a test walks them); everything else is proxied to the engine. A per-process cache that a forget must clear calls `owner_cache.bump` (shared `CACHE_EPOCH_FILE`). Boot-time schema steps never take a table lock when the change is already there.
+- Admin alerts go through `alerts.send_admin_alert` / `alerts.notify`, never `send_telegram` directly: `urgent=True` only for what needs someone now (route down, cookies, bulk failures, paid jobs late); the rest is held for the daily digest. Never an email address or video title in an alert (`alerts.user_ref`).
 - A drain-cancelled job keeps its manifest and reservation and is resumed, never marked failed or completed.
-- The remote worker gets job options and the source, never a credential, and writes only plain non-dot output files into its job's directory (`remote_worker.job_options`, `safe_relpath`). A remote job holds no GPU slot (`_local_running`); new per-job state it needs lives as files in the job dir, not in memory.
+- The disk sweeps and size caps delete only what `_job_is_active` / `_upload_is_live` call dead: a submission counts as live from its `_begin_job_dir` (source still streaming in) and an agent upload slot until it expires.
+- The remote worker gets job options, the source and the transcript and scene probabilities this host prepared for it (`PREPARE_TRANSCRIPT`, `PREPARE_SCENES`), never a credential, and writes only plain non-dot output files into its job's directory (`remote_worker.job_options`, `safe_relpath`). A remote job holds no GPU slot (`_local_running`); new per-job state it needs lives as files in the job dir, not in memory.
 - Whatever is read back from a job directory (recipes, metadata, sidecars, subtitles, log lines) is data from possibly another machine: numbers as numbers, text as text, never pasted into an ffmpeg filter graph, a path or markup. A filter string that is not a plain chain of `editor._ALLOWED_FILTERS` is not run.
 
 **Download proxies**
 - Route order is direct → static → paid (per-GB `PROXY_URL`). Never use the paid proxy for non-YouTube URLs, nor for failures another IP cannot fix (`static_failure_warrants_paid`).
 - The probe also carries `YOUTUBE_COOKIES`, like the download does; first attempt with cookies, second anonymous, on probe and download alike.
 - Keep the explicit `yt_clients.py` client list; never put `player_skip: webpage` back. `noplaylist` always; non-video URLs refused by an allowlist.
-- Every yt-dlp extraction that sends `YOUTUBE_COOKIES` takes its cookie file from a `yt_account.Session` (one of the configured accounts, `YOUTUBE_COOKIES_2`.. add more) and runs inside its `request()`, and none is sent while `yt_account.cooling_down()`: each account's budget is shared by every probe and download. A failure that is only the account limit is retried after the cooldown (`YT_ACCOUNT_LIMITED`), never reported as a broken video.
+- Every yt-dlp extraction that sends `YOUTUBE_COOKIES` takes its cookie file from a `yt_account.Session` (one of the configured accounts, `YOUTUBE_COOKIES_2`.. add more) and runs inside its `request()`, and none is sent while `yt_account.cooling_down()`: each account's budget is shared by every probe and download. A failure that is only the account limit is retried after the cooldown (`YT_ACCOUNT_LIMITED`), never reported as a broken video. An age-restricted refusal moves the video to another account (`Session.age_gated`), never to the paid proxy.
+- A YouTube video is fetched once per `SOURCE_CACHE_HOURS` (`source_cache.py`: source, transcript and probe by video id). Only whole sources over a free route go in (never ranged, never the per-GB proxy's 720p); a new dot entry of `output/` that holds data stays out of `app._output_jobs_size`.
 - `DOWNLOAD_SKIP_STATICS` only when the probe saw every static bot-checked. `PAID_PROXY_DAILY_MB` is the hard daily ceiling. Never keep `PROXY_URL` in a local `.env`.
 
 **Agent access**
 - MCP stdio: swap `sys.stdout` for stderr **before importing `app`**, and enter the app lifespan.
 - Webhook URLs go through `security_utils.assert_public_url` at submit AND at delivery.
 - API-key auth can never manage keys, consent to OAuth, touch billing or delete the account (`get_session_user_required`). OAuth tokens are ordinary `osk_` keys that carry their scope (`cloud/scopes.py`): a new MCP tool endpoint joins `_MCP_ROUTES`.
-- Cloud `/videos` and `/thumbnails` answer only to a signature, the owner's media token or the owner's credentials (`app._authorize_media`). Any media URL handed outside the dashboard (MCP, webhook, API) goes through `_signed_media_url` / `media_auth.sign_absolute_url`; a new job-like directory writes `.owner`.
+- Cloud `/videos` and `/thumbnails` answer only to a signature, the owner's media token or the owner's credentials (`app._authorize_media`). A `/videos` request is sent to storage (`cloud/media_redirect.py`) only for the owner's own browser and only for a file a `user_videos` row names: never a free job's clean twin, never in exchange for a signed link alone; an edit that rewrites a file calls `hold` before and `forget` after its archive. Any media URL handed outside the dashboard (MCP, webhook, API) goes through `_signed_media_url` / `media_auth.sign_absolute_url`; a new job-like directory writes `.owner`.
 - The Google callback redirects with a single-use code bound to the dashboard's `cc` challenge, never the session JWT (`/api/auth/exchange`).
 - yt-dlp and server-side scrapes run inside `ssrf_guard.guarded()`: redirects and DNS answers are checked at connect time, not only the submitted URL.
 
 **Billing, account, privacy**
 - GDPR erasure order is fixed: Stripe cancel (abort on failure) → R2 purge → one DB transaction over `USER_OWNED_TABLES`. Never via API key. Every new table referencing `users.id` joins `USER_OWNED_TABLES` (a test enforces it).
+- A paid job's source goes to R2 only under `users/<uid>/<job>/source/` with a random name (`cloud/source_archive.py`): never restored with the project, deleted after `SOURCE_ARCHIVE_DAYS` by the daily sweep, and read back only through `_archived_source` / `_locate_or_fetch_source` after the owner check. A change to its retention changes `docs/compliance/retencion.md` and the privacy policy in the same commit.
 - Coupon ids and promotion codes live only in env / Stripe, never in this repo.
 - Cancel and churn alerts carry the reason and rating, never the user's free text. Deletion reasons are a closed list.
 - `reserve_process_minutes` never reserves more than the balance, whatever the client asks; the source cut travels in the resume manifest.
+- Posting to socials is part of the paid plans, and so is connecting them: `/api/social/connect` answers a free account with a 402 `connect_requires_plan` (`social_profiles.require_paid_plan_to_connect`; bought minutes count as paid), and a free account that connected before that gets `FREE_SOCIAL_POSTS` posts in total (`app._claim_free_post`, ledger rows that survive restarts), then a 402 `post_requires_plan`. Both open the plans modal. Every endpoint that posts through the managed Upload-Post account claims a post, and every one that opens its connect page checks the plan.
 - Lifecycle/commercial emails go through `emails.send_commercial_email` (opt-out + unsubscribe headers), once per account per kind.
 - The support-ops API (`cloud/support_ops.py`, `/api/support-ops/v1`) is 404 unless its keys are set, never emails the customer, never calls Stripe and writes only the account in the path; every write is a dry run unless `dry_run: false` + ticket, and returns a `before` that `restore` can write back. A banned account (`users.ban_reason`) authenticates as nobody.
 

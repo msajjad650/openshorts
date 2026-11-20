@@ -6,6 +6,7 @@ import { track } from '../lib/analytics';
 import { stashPendingPlan, readPendingPlan, clearPendingPlan } from '../lib/pendingPlan';
 import { useBackFromStripe } from '../lib/backFromStripe';
 import SegmentedControl from './ui/SegmentedControl';
+import { FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VIDEO } from '../lib/clipProgress';
 
 const PLAN_ORDER = ['starter', 'creator', 'pro'];
 const PLAN_BLURB = {
@@ -34,7 +35,10 @@ export default function PricingSection({ onRequireLogin }) {
   const [interval, setInterval] = useState('month');
   const [loading, setLoading] = useState(true);
   const [busyPrice, setBusyPrice] = useState(null);
-  useBackFromStripe(() => setBusyPrice(null));
+  // Set in the same tick as the click: a double click (or monthly then yearly)
+  // before React re-renders the disabled buttons must not open two checkouts.
+  const inFlightRef = useRef(false);
+  useBackFromStripe(() => { inFlightRef.current = false; setBusyPrice(null); });
   // One automatic checkout per page load (resumed plan or ?plan= link).
   const autoCheckoutRef = useRef(false);
 
@@ -52,6 +56,8 @@ export default function PricingSection({ onRequireLogin }) {
       onRequireLogin?.(entry.price_id);
       return;
     }
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setBusyPrice(entry.price_id);
     // `source` segments this surface from the two modals (see TopUpModal), which
     // now emit the same three events. `resumed`: the plan was picked before
@@ -75,6 +81,7 @@ export default function PricingSection({ onRequireLogin }) {
       window.location.href = url;
     } catch (e) {
       track('CheckoutFailed', { props: { ...props, reason: String(e?.detail || e?.message || 'unknown').slice(0, 120) } });
+      inFlightRef.current = false;
       setBusyPrice(null);
       alert(e?.detail || 'Could not start checkout. Please try again.');
     }
@@ -149,12 +156,13 @@ export default function PricingSection({ onRequireLogin }) {
           </div>
           <ul className="space-y-2 text-sm text-ink2 mb-6 flex-1">
             <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span><b>{FREE_MINUTES} min</b> of video / month</span></li>
+            <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span>The <b>{FREE_CLIPS_PER_VIDEO} to {FREE_CLIPS_QUIET} best clips</b> of each video</span></li>
             <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span>YouTube URL or upload</span></li>
             <li className="flex items-start gap-2"><Cpu size={16} className="text-ok shrink-0 mt-0.5" /> <span>Same <b>GPU rendering</b>, about 50s per 8-min video</span></li>
             <li className="flex items-start gap-2"><KeyRound size={16} className="text-ok shrink-0 mt-0.5" /> <span>Gemini key included, no setup</span></li>
             <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span>No credit card — Google sign-in</span></li>
             <li className="flex items-start gap-2"><Check size={16} className="text-muted shrink-0 mt-0.5" /> <span className="text-muted">Watermark · clips kept 7 days</span></li>
-            <li className="flex items-start gap-2"><Check size={16} className="text-muted shrink-0 mt-0.5" /> <span className="text-muted">Download only: no auto-posting or Autopilot</span></li>
+            <li className="flex items-start gap-2"><Check size={16} className="text-muted shrink-0 mt-0.5" /> <span className="text-muted">Download your clips; posting to socials and Autopilot are in the paid plans</span></li>
           </ul>
           <button
             onClick={() => { window.location.hash = '#app'; }}
@@ -187,6 +195,7 @@ export default function PricingSection({ onRequireLogin }) {
               </div>
               <ul className="space-y-2 text-sm text-ink2 mb-6 flex-1">
                 <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span><b>{entry.minutes} min</b> of video / month</span></li>
+                <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span><b>Every clip</b> of each video, up to {MAX_CLIPS_PER_VIDEO}</span></li>
                 <li className="flex items-start gap-2"><Check size={16} className="text-ok shrink-0 mt-0.5" /> <span><b>No watermark</b>, no 7-day clip expiry</span></li>
                 <li className="flex items-start gap-2"><Cpu size={16} className="text-ok shrink-0 mt-0.5" /> <span><b>GPU rendering</b>, about 50s per 8-min video</span></li>
                 <li className="flex items-start gap-2"><Send size={16} className="text-ok shrink-0 mt-0.5" /> <span><b>Auto-post every clip</b> to TikTok, Instagram, YouTube, Facebook, LinkedIn, Threads &amp; Bluesky</span></li>
@@ -197,7 +206,7 @@ export default function PricingSection({ onRequireLogin }) {
               </ul>
               <button
                 onClick={() => checkout(entry)}
-                disabled={busyPrice === entry.price_id}
+                disabled={busyPrice !== null}
                 className={`w-full ${highlight ? 'btn-primary' : 'btn-ghost'}`}
               >
                 {busyPrice === entry.price_id ? <Loader2 size={18} className="animate-spin" /> : `Get ${plan}`}

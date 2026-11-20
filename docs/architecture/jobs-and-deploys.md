@@ -2,6 +2,10 @@
 
 ## Concurrency model
 
+The API itself can run as one engine plus several front processes so it uses
+more than one core: see `multiprocess-api.md`.
+
+
 Async job queue with semaphore-based concurrency control, sized by
 `MAX_CONCURRENT_JOBS` (default 5). Jobs auto-clean after 1 hour.
 
@@ -34,7 +38,18 @@ Guards that keep the card from filling:
   `[job-cpu]` reports `asr_device` (`cuda` / `cpu`) per job.
 - **Host-wide transcription slots** (`transcribe_backends.host_asr_slot`,
   `ASR_HOST_SLOTS`, default 2): flock files `output/.asr-gpu-N.lock`, shared by
-  every job process and by both containers of a deploy.
+  every job process and by both containers of a deploy. A source of at least
+  `ASR_LONG_SECONDS` (1800) never takes the last slot, so short ones never
+  wait behind long ones only. Whisper keeps the slot when it falls to the
+  CPU: the process holds its CUDA context until it exits, and handing the
+  slot back let the next process in to hit the same OOM.
+- **Parakeet leaves the card before the whisper fallback**
+  (`transcribe_backends._drop_parakeet`): its arena (~7 GB on a long video)
+  made whisper hit CUDA OOM and the whole transcription ran on the CPU. A
+  rejected Parakeet result skips the script-drift repair, and CPU whisper
+  runs on `WHISPER_CPU_THREADS` (default min(8, cores)), not on the job's
+  `OMP_NUM_THREADS=1`. Measured on 18-nov-2026: two such videos held both
+  slots for an hour and eight jobs slept behind them with the GPU at ~18%.
 - **Queue admission** (`app._wait_for_shared_gpu`): a job starts only when
   running-here + running-on-the-draining-instance < `MAX_CONCURRENT_JOBS` and
   `nvidia-smi` reports at least `GPU_MIN_FREE_MB` (4500) free; an idle card
@@ -51,6 +66,13 @@ MD5 + audio):
 
 Speed at equal quality:
 
+- **A full card is not "no NVENC"** (`ffmpeg_utils.nvenc_available`): the
+  probe's CUDA out-of-memory or timeout is retried (`NVENC_PROBE_ATTEMPTS`,
+  `NVENC_PROBE_BACKOFF`), and if the card stays full the libx264 verdict
+  lasts `NVENC_REPROBE_SECONDS` (60), not the whole job. Only a host without
+  the encoder is libx264 for good. On 18-nov-2026 one probe in five hit a VRAM
+  peak and the cached "no" sent 6 of 14 jobs entirely to libx264: 100% CPU,
+  full swap, and the OOM killer took the API.
 - **Cut on the card** (`ffmpeg_utils.cut_clip`, NVDEC → NVENC with
   `-hwaccel_output_format cuda`) for 8-bit 4:2:0 sources; byte-identical to the
   CPU cut. Other sources and a failed GPU cut decode on the CPU.
@@ -220,6 +242,21 @@ parakeet text.
   manifest's priority. At startup the worker starts only after that lookup,
   so the first job it takes is already ranked by the current plan.
 
+## Admin alerts and the daily digest (`cloud/alerts.py`, `cloud/digest.py`)
+
+`alerts.send_admin_alert(subject, body, urgent=...)` and `alerts.notify(text,
+urgent=...)` are the only ways to the admin chat. Only `urgent=True` goes out at
+once (Telegram, plus `ADMIN_EMAIL` with SMTP): a dead or per-GB download route
+and its recovery, expired YouTube cookies, the paid proxy's daily budget hit,
+a job failure rate that is not the users' own videos (at most every 3 h), paid
+videos waiting late and their recovery, transcription on the CPU. Everything
+else (payments, plans, cancellations, account deletions, free backlog, brake,
+output rate, paid proxy use) is held: one JSON line in
+`output/.alerts_held.jsonl` (flock), counted by kind in the next daily digest
+with the day's figures and the queue's last measurement. The digest goes out
+at `DIGEST_HOUR_UTC` (7) from the active instance only. `TELEGRAM_ALERTS=all`
+sends every alert on its own again.
+
 ## Queue watch (`cloud/queue_watch.py`, Cloud only)
 
 A saturated queue fails nothing, it only starts jobs hours late, so the
@@ -228,7 +265,8 @@ API measures its queue (`app._queue_watch_snapshot`: waiting jobs paid/free,
 oldest wait of each, running vs `MAX_CONCURRENT_JOBS`, jobs finished in the last
 hour, the `queue_estimate` wait for a new job) and alerts through
 `alerts.send_admin_alert` (the admin Telegram chat, plus `ADMIN_EMAIL` with SMTP)
-when:
+when (only paid jobs waiting late page at once, the rest goes to the daily
+digest):
 
 - a paid job waits more than `QUEUE_ALERT_PAID_WAIT_MINUTES` (10), or
 - the oldest free job waits more than `QUEUE_ALERT_FREE_WAIT_MINUTES` (30), or
@@ -410,6 +448,14 @@ coordinates them:
 - Each instance writes its id to `output/.instance` at startup. An instance that
   sees another id there is the old one and **drains**: it finishes the jobs it is
   running, starts none, and leaves queued manifests on disk.
+- The marker line is `<id> <generation>`, the generation being the deploy's
+  (`DEPLOY_GENERATION`, else the timestamp at the end of Coolify's container
+  name). Only an instance of a newer (or unknown) deploy in the marker makes
+  another drain: the old container of a deploy that the kernel killed while it
+  drained (host out of memory) and Docker restarted no longer takes the queue
+  from the new one. It boots drained, adopts no manifest, keeps every
+  reservation on disk out of the orphan refund, and a new instance that finds
+  an older deploy's line in the marker writes its own back.
 - A running job heartbeats its `.resume.json` every 10 s. The resume scan
   (startup + every 30 s) re-enqueues only manifests nobody heartbeated for 60 s,
   so no job runs twice and none is lost. Max 2 resume attempts, and only a run
@@ -482,3 +528,46 @@ pool is sized for waiting: a probe mostly sleeps on the YouTube account's
 turn, and 4 processes asleep queued the rest (estimate p50 45 s). The cost
 line (`/api/process/estimate`) gives up after `ESTIMATE_PROBE_TIMEOUT` (20 s).
 
+
+## Clips of a free job
+
+A job's render time grows with its clips (the cut, the reframe and the caption
+pass are per clip; only the download, the transcript and the selection are per
+job), so the number of clips a free job renders is what sizes the free queue's
+output to the hardware. `FREE_MAX_CLIPS` (unset or 0: no cap) caps it at
+dispatch (`app._cap_clips_at_dispatch`), through `CLIP_TARGET_MIN/MAX` like the
+slow lane's brake and like the user's own `target_clips`: the scoring pass
+still ranks every window and the best ones are kept. Only a job that carries
+the free-plan mark, was not bought with a top-up and is still at a free
+priority when it is dispatched: a job whose owner paid while it waited was
+raised and gets every clip. Decided at dispatch, so the jobs already waiting
+get the setting of the moment, here and on the remote worker. The job's log
+says it (`FREE_CLIPS_LOG`, kept by `log_view`). With the brake on, the lower
+of the two caps applies.
+
+The cap is for when people are waiting. With `FREE_QUIET_MAX_CLIPS` set (and
+larger), a free job gets that many while the whole free queue is short
+(`queue_mode.queue_quiet`): every lane's estimated wait, as the queue watch
+last measured it, under `FREE_QUIET_MINUTES` (default 10). No hysteresis on
+purpose: it is decided per job, and more clips per job lengthen the queue,
+which brings the lower cap back by itself. The measurement has to be recent
+(`QUIET_FIGURES_MAX_AGE`); with the saturation mode off or killed nobody
+measures and the lower cap stays.
+
+## Frame rate of free jobs
+
+Every pass after the cut (tracking, scene detection, the reframe render,
+captions, hook, the watermarked copy) reads the cut, so its frame rate sets
+the decoder and encoder work of the whole job. A free-plan job is cut at up to
+`FREE_MAX_FPS` (default 30, `0` keeps the source rate): the API puts
+`CUT_MAX_FPS` in the job's environment next to `WATERMARK` (and it travels to
+the remote worker as a job option), and `ffmpeg_utils.cut_rate_filter` adds
+`-vf fps=` to both the GPU and CPU cut. The new rate is the source's divided by
+a whole number (60 -> 30, 59.94 -> 29.97, 50 -> 25), so the kept frames are
+evenly spaced; a source under 1.5x the cap is left alone. Paid plans keep the
+source rate.
+
+Skipping the source's non-reference frames while decoding (`-skip_frame
+noref`) was measured and rejected: it saves part of the first read, but the
+frames it keeps are unevenly spaced and a quarter of the 30 fps output came
+out as repeats (visible judder).

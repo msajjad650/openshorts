@@ -35,8 +35,16 @@ READY_TIMEOUT = float(os.environ.get("WORKER_READY_TIMEOUT", "1800") or 1800)
 CHUNK = 32 * 1024 * 1024
 NICE = max(0, min(19, int(os.environ.get("JOB_NICE", "10") or 10)))
 MAX_SOURCE_BYTES = int(float(os.environ.get("WORKER_MAX_SOURCE_GB", "20") or 20) * 1024 ** 3)
+# A worker with a GPU of its own asks the API host for the source alone: it
+# transcribes and finds the scenes itself sooner than that host, busy with its
+# own jobs, can prepare them for it.
+SOURCE_ONLY = os.environ.get("WORKER_SOURCE_ONLY", "").strip() == "1"
 
 _stop = threading.Event()
+
+
+class Stopping(Exception):
+    """This worker is being stopped: the job goes back, it did not fail."""
 
 
 class Gone(Exception):
@@ -99,6 +107,14 @@ def safe_job_path(job_id, path):
     return None
 
 
+def claim_body():
+    """What this worker says of itself when it asks for a job."""
+    body = {"worker": NAME}
+    if SOURCE_ONLY:
+        body["source_only"] = True
+    return body
+
+
 def job_env(options):
     """This worker's environment plus the job's settings, from the same
     closed list of names the API sends (``remote_worker.allowed_option``):
@@ -121,12 +137,68 @@ def fetch_source(job_id, claim, target, size):
     got = 0
     with open(target, "wb") as f:
         for chunk in r.iter_content(1024 * 1024):
+            if _stop.is_set():
+                raise Stopping("worker stopping")    # a long transfer: hand the job back now
             got += len(chunk)
             if got > limit:
                 raise RuntimeError("source: larger than announced")
             f.write(chunk)
     if size is not None and got != int(size):
         raise RuntimeError(f"source: {got} bytes, expected {size}")
+
+
+def fetch_transcript(job_id, claim, out_dir):
+    """The transcript the API host prepared for this source, left where
+    main.py looks for one (its checkpoint): no transcription on this CPU.
+    Anything wrong with it and this worker transcribes, as it always did."""
+    try:
+        r = _call("GET", f"/internal/worker/jobs/{job_id}/transcript", claim,
+                  tries=2, stream=True, timeout=120)
+        if r.status_code != 200:
+            return False
+        body = b""
+        for chunk in r.iter_content(256 * 1024):
+            body += chunk
+            if len(body) > remote_worker.MAX_TRANSCRIPT_BYTES:
+                return False
+        payload = json.loads(body)
+        if not remote_worker.valid_transcript(payload):
+            return False
+        with open(os.path.join(out_dir, remote_worker.TRANSCRIPT_FILE), "w") as f:
+            json.dump({"source": payload["source"], "transcript": payload["transcript"]}, f)
+        return True
+    except Gone:
+        raise
+    except Exception as e:
+        log(f"{job_id}: transcript not fetched ({type(e).__name__})")
+        return False
+
+
+def fetch_scenes(job_id, claim, out_dir):
+    """The scene probabilities the API host's card prepared for this source,
+    left where main.py looks for them: no TransNetV2 on this CPU. Anything
+    wrong with them and the clips run the network, as they always did."""
+    try:
+        r = _call("GET", f"/internal/worker/jobs/{job_id}/scenes", claim,
+                  tries=2, stream=True, timeout=120)
+        if r.status_code != 200:
+            return False
+        body = b""
+        for chunk in r.iter_content(256 * 1024):
+            body += chunk
+            if len(body) > remote_worker.MAX_SCENES_BYTES:
+                return False
+        payload = json.loads(body)
+        if not remote_worker.valid_scenes(payload):
+            return False
+        with open(os.path.join(out_dir, remote_worker.SCENES_FILE), "w") as f:
+            json.dump({k: payload[k] for k in ("source", "fps", "frames", "probs")}, f)
+        return True
+    except Gone:
+        raise
+    except Exception as e:
+        log(f"{job_id}: scenes not fetched ({type(e).__name__})")
+        return False
 
 
 def upload_file(job_id, claim, out_dir, rel):
@@ -205,7 +277,9 @@ def run_job(job_id, claim):
             info = r.json() if r.status_code == 200 else {}
             if info.get("state") == "ready":
                 break
-            if time.time() > deadline or _stop.is_set():
+            if _stop.is_set():
+                raise Stopping("worker stopping")
+            if time.time() > deadline:
                 raise RuntimeError("the source never became ready")
             time.sleep(3)
 
@@ -219,8 +293,12 @@ def run_job(job_id, claim):
         if args is None:
             raise RuntimeError("arguments refused")
         fetch_source(job_id, claim, source, info.get("source_size"))
+        prepared = bool(info.get("transcript_size")) and fetch_transcript(job_id, claim, out_dir)
+        scenes = bool(info.get("scenes_size")) and fetch_scenes(job_id, claim, out_dir)
         cmd = [sys.executable, "-u", "main.py", "-i", source, "-o", out_dir] + args
-        log(f"{job_id}: rendering ({os.path.getsize(source) >> 20} MB source)")
+        log(f"{job_id}: rendering ({os.path.getsize(source) >> 20} MB source"
+            f"{', transcript prepared' if prepared else ''}"
+            f"{', scenes prepared' if scenes else ''})")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 env=job_env(info.get("env")), cwd=os.getcwd(),
                                 preexec_fn=(lambda: os.nice(NICE)) if NICE else None)
@@ -268,7 +346,7 @@ def run_job(job_id, claim):
 
         while proc.poll() is None:
             if _stop.is_set():
-                raise RuntimeError("worker stopping")
+                raise Stopping("worker stopping")
             flush()                          # also the heartbeat
             time.sleep(3)
         t.join(30)
@@ -287,7 +365,8 @@ def run_job(job_id, claim):
             _call("POST", f"/internal/worker/jobs/{job_id}/log", claim, tries=1,
                   json={"lines": [f"Execution error: remote worker failed ({type(e).__name__}) (killed)."]})
             _call("POST", f"/internal/worker/jobs/{job_id}/done", claim, tries=1,
-                  json={"returncode": -15})
+                  json={"returncode": -15,
+                        "stopping": isinstance(e, Stopping) or _stop.is_set()})
         except Exception:
             pass
     finally:
@@ -308,14 +387,14 @@ def main():
         sys.exit("WORKER_API_URL must be https")
     signal.signal(signal.SIGTERM, lambda *_: _stop.set())
     signal.signal(signal.SIGINT, lambda *_: _stop.set())
-    log(f"{NAME}: {SLOTS} slot(s), API {API}")
+    log(f"{NAME}: {SLOTS} slot(s){', source only' if SOURCE_ONLY else ''}, API {API}")
     running = []
     while not _stop.is_set():
         running = [t for t in running if t.is_alive()]
         claimed = False
         if len(running) < SLOTS:
             try:
-                r = _call("POST", "/internal/worker/claim", tries=1, json={"worker": NAME})
+                r = _call("POST", "/internal/worker/claim", tries=1, json=claim_body())
                 body = r.json() if r.status_code == 200 else {}
                 if body.get("job_id") and not valid_job_id(body["job_id"]):
                     log("claim: job id refused")

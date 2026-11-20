@@ -99,7 +99,7 @@ _CONTENT_HINTS = (
     "join this channel", "not available on this app", "is not a valid url",
     "unsupported url", "no video formats found", "premieres in", "will begin in",
     "this live event", "no duration in metadata", "requested format is not available",
-    "account has been terminated", "video is age", "confirm your age",
+    "account has been terminated", "video is age", "confirm your age", "age-restricted",
     # An uploader's country block: the residential pool exits from the same
     # blocked countries, so the paid probe failed with the identical error in
     # 5 of the 6 cases between 3-sep and 5-sep-2026 (3.6 MB each, and the
@@ -200,6 +200,17 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     if reason:
         raise NotASingleVideo(f"This link is {reason}.")
 
+    # A YouTube video probed in the last hours (the download cache keeps its
+    # length): a video's length does not change, and asking again would spend
+    # a request of a YouTube account for an answer we already have.
+    import source_cache
+    known = source_cache.probe_get(url)
+    if known:
+        if known.get("max_height"):
+            _probe_facts[url] = {"at": time.time(), "max_height": int(known["max_height"]),
+                                 "duration": int(known["seconds"])}
+        return known["seconds"] / 60.0
+
     bgutil_http = os.environ.get("BGUTIL_BASE_URL", "").strip()
     bgutil_script = os.environ.get("BGUTIL_SCRIPT_PATH", "").strip()
     # Same client lists as the download (yt_clients.py): the authed defaults
@@ -249,10 +260,13 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     # One of the configured accounts (yt_account.Session), as a private file.
     session = yt_account.Session()
     try:
-        return _probe_with_proxies(url, proxies, strategies, static_errors,
-                                   paid, session.path)
+        minutes = _probe_with_proxies(url, proxies, strategies, static_errors,
+                                      paid, session.path)
     finally:
         session.close()
+    facts = _probe_facts.get(url) or {}
+    source_cache.probe_put(url, minutes * 60.0, facts.get("max_height"))
+    return minutes
 
 
 # --- The probe in its own process -------------------------------------------
@@ -465,6 +479,8 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                 route_errors.append(str(e)[:300])
                 if authed and yt_account.is_rate_limit(str(e)):
                     session.limited()   # moves to another account if one is awake
+                elif authed and yt_account.is_age_gate(str(e)):
+                    session.age_gated()  # an age-verified account may open it
         else:
             if not is_paid:
                 static_errors[_route_name(proxy, proxies)] = (
@@ -860,16 +876,42 @@ async def free_actions_today(user_id, job_type: str) -> int:
         )).scalar_one() or 0)
 
 
+async def free_actions_total(user_id, job_type: str) -> int:
+    """How many zero-minute ``job_type`` rows this user has, ever."""
+    async with database.session() as session:
+        return int((await session.execute(
+            select(func.count(UsageLedger.id)).where(and_(
+                UsageLedger.user_id == user_id,
+                UsageLedger.job_type == job_type,
+                UsageLedger.minutes == 0,
+            ))
+        )).scalar_one() or 0)
+
+
 async def record_free_action(user_id, job_id: str, job_type: str):
-    """A committed zero-minute row: counts a free daily allowance (AI edits)
-    across restarts without touching the balance."""
+    """A committed zero-minute row: counts a free allowance (AI edits per day,
+    social posts in total) across restarts without touching the balance.
+    Returns the row id, for undo_free_action."""
+    row = UsageLedger(
+        user_id=user_id, job_id=str(job_id), job_type=job_type,
+        minutes=_D(0), minutes_from_plan=_D(0), minutes_from_topup=_D(0),
+        status="committed",
+    )
     async with database.session() as session:
         async with session.begin():
-            session.add(UsageLedger(
-                user_id=user_id, job_id=str(job_id), job_type=job_type,
-                minutes=_D(0), minutes_from_plan=_D(0), minutes_from_topup=_D(0),
-                status="committed",
-            ))
+            session.add(row)
+    return str(row.id)
+
+
+async def undo_free_action(ledger_id):
+    """Give back a free action whose work failed (zero-minute rows only)."""
+    if not ledger_id:
+        return
+    async with database.session() as session:
+        async with session.begin():
+            row = await session.get(UsageLedger, ledger_id)
+            if row is not None and row.minutes == 0 and row.status == "committed":
+                await session.delete(row)
 
 
 async def commit_reservation(ledger_id: str):

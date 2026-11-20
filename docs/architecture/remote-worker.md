@@ -31,6 +31,21 @@ Everything the worker sends lands as files in the job directory
 deploy handover either container can answer the worker while the one that
 dispatched the job keeps following it.
 
+## A worker with a GPU of its own
+
+The same `worker.py` runs from the GPU image (`--build-arg GPU=1`) on a host
+with a card, with the container given the GPU: it then transcribes, finds the
+scenes and encodes on that card, like the API host does. Set
+`WORKER_SOURCE_ONLY=1` on it. Its claim says so (`source_only`, kept in the
+claim file), and the API host's `--prepare-only` run for that job downloads
+and cuts the source and nothing more: no transcription and no scene pass
+(`remote_worker.source_only_env`). Preparing them there made such a worker
+wait for a host that is busy by definition (a job only goes out while another
+waits for a slot), while its own card sat idle. A transcript the download
+cache already holds for the source still travels: it costs the API host
+nothing. The worker is no more trusted for it: it still holds no download
+credential and gets the source from the API host.
+
 ## Which jobs go
 
 `app._remote_eligible`: a free job (normal or slow lane) that never failed
@@ -51,6 +66,12 @@ GPU admission counts, and `_jobs_busy_elsewhere` skips a job with a claim.
   the auto-retry runs it on this host. A retried job is never remote again
   (a job resumed after a deploy starts over and can be).
 - The download fails: the job fails as a local one would, with the same logs.
+- The worker is stopped or restarted (SIGTERM): it hands its running jobs back
+  with `stopping: true` (also the ones whose source this host is still
+  preparing, and the ones in the middle of the source transfer; the compose
+  file gives it `stop_grace_period` to do so), they are retried here like any
+  remote failure, and they do not count towards the breaker (`REMOTE_BREAKER_FAILURES` of the last
+  10 jobs failing parks the worker for `REMOTE_BREAKER_SECONDS`, 30 min).
 - The instance that dispatched the job is stopped before the worker ends: the
   manifest stays, the next instance resumes the job locally and
   `_register_resumed` clears the claim. The worker's next call gets `410` and
@@ -67,7 +88,10 @@ the API host.
   settings cross by name from a closed list (`remote_worker.allowed_option`:
   `WATERMARK`, the source caps, `AUTO_*`, `CLIP_*`), checked on both sides, and
   the command is `--format <choice>` or nothing (`worker_args`, `safe_args`).
-- It can read one thing: the source of a job it holds a live claim for.
+- It can read three things, all of a job it holds a live claim for: the
+  source and, when this host prepared them, the source's transcript
+  (`.../transcript`) and scene probabilities (`.../scenes`, see below). It can
+  never write either back: they are dotfiles.
 - It can write only render outputs into that job's directory
   (`remote_worker.safe_relpath`): one plain file name with a known extension,
   no subdirectory, no link, **no dotfile**, and never a file that was there
@@ -124,7 +148,10 @@ it may hold at once), `REMOTE_LEASE_SECONDS`, `REMOTE_MAX_SECONDS`,
 `REMOTE_BREAKER_SECONDS`, `REMOTE_QUIET_MINUTES` (minutes of the hour, UTC,
 like `55-5`, with no new claim: when the worker's host shares its link with
 something that peaks at fixed times), `REMOTE_SOURCE_MBPS` (cap for all source
-transfers together, 0 for none).
+transfers together, 0 for none), `PREPARE_TRANSCRIPT` (`1`, `cache` or unset:
+whether the source's transcript is prepared for the worker), `PREPARE_SCENES`
+(`1` or unset: whether the source's scene probabilities are), `SCENE_HOST_SLOTS` (2),
+`PREPARE_SCENES_WAIT` (30), `PREPARE_SCENES_MAX_MINUTES` (45).
 
 The source download is the worker's one long call: the API touches the lease
 while it streams the file (`_source_chunks`), so a slow transfer is not taken
@@ -134,7 +161,8 @@ tripped the breaker, leaving the worker idle exactly when the API host was
 short of CPU.
 
 Worker: `WORKER_API_URL` (https), `WORKER_TOKEN`, `WORKER_SLOTS`,
-`GEMINI_API_KEY`, plus the pipeline defaults the API host sets for itself
+`GEMINI_API_KEY`, `WORKER_SOURCE_ONLY` (`1` on a worker with a GPU: the source
+alone, see above), plus the pipeline defaults the API host sets for itself
 (`AUTO_LAYOUT`, `TRANSCRIBE_BACKEND`, `FFMPEG_THREADS`, `CLIP_WORKERS`...): only
 per-job options travel with a job.
 
@@ -144,6 +172,42 @@ On a CPU each job costs several times the CPU of a GPU job. Size
 
 What limits a CPU worker is rarely its slots:
 
+- **Transcription.** On a CPU the transcript is the largest single cost of a
+  job and about half of its wall time. With `PREPARE_TRANSCRIPT` set on the
+  API host, `main.py --prepare-only` leaves the transcript in the job
+  directory as main.py's own checkpoint (`.transcript_checkpoint.json`):
+  `cache` takes only what the download cache holds for that very source, `1`
+  otherwise transcribes there, on the card, inside the same `ASR_HOST_SLOTS`
+  as any job, and only if a slot frees up within `PREPARE_TRANSCRIPT_WAIT`
+  seconds (45): when the card's own jobs keep them busy the worker
+  transcribes for itself, so neither host waits for the other. It
+  transcribes on the card or not at all (`transcribe_backends.require_gpu`):
+  a CUDA failure leaves the transcript to the worker instead of falling back
+  to CPU whisper on the API host. The claim then announces `transcript_size`, the worker fetches
+  it (`GET .../transcript`, re-serialised as data and shape-checked on both
+  sides, `remote_worker.valid_transcript`), puts it at the same place in its
+  own job directory and its main.py reuses it exactly like a resumed run.
+  Anything wrong with it and the worker transcribes as before. A remote run
+  that fails leaves the checkpoint for the retry on the API host; a completed
+  one removes it. Watch `asr_wait_s` in the API host's `[job-cpu]` lines: the
+  prepared transcripts share its transcription turns.
+- **Scene detection.** Once the transcript comes prepared, TransNetV2 is
+  about half of what is left: it runs on every clip, on the CPU (profiled on a
+  worker, 19-nov-2026). With `PREPARE_SCENES=1` on the API host, `main.py
+  --prepare-only` runs it once over the whole source on the card, inside one
+  of `SCENE_HOST_SLOTS` (2) host slots of its own, never the transcription
+  ones (sharing them made the transcripts wait behind the scenes)
+  (`PREPARE_SCENES_WAIT` seconds at most, and not for sources over
+  `PREPARE_SCENES_MAX_MINUTES`), and leaves the per-frame
+  probabilities in `.scene_probs.json` (float32, base64, tied to the source by
+  name and duration). The claim announces `scenes_size`, the worker fetches
+  them (`GET .../scenes`, shape-checked on both sides,
+  `remote_worker.valid_scenes`) and main.py maps them onto each clip by time
+  from the clip's cut start (`scene_detection.use_prepared`,
+  `register_clip`): the clip is still decoded small for its frame count, the
+  network does not run. Measured over 24 clips of 8 corpus sources: every cut
+  found clip by clip is found within 1.5 frames. Anything wrong with them and
+  each clip runs the network as before; they are removed with the transcript.
 - **Transcription turns.** `ASR_HOST_SLOTS` (default 2) is sized for a GPU's
   memory. On a CPU host a transcription takes minutes, so with 2 turns most
   slots sit waiting for one (the job's `asr_wait_s`). Raise it on a CPU host

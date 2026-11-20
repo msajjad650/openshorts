@@ -94,6 +94,8 @@ every refusal, API and MCP included. Refusals are counted in the queue alerts.
 - Every surface that opens the plan modal passes a `source` (`meter`, `menu`, `results_banner`, `partial_banner`, `partial_processing`, `first_video_banner`, `watermark`, `autopilot`, `queue`, `queue_full`, `thumbnails`, `clip_editor`, `autopilot_run`); it rides on `UpsellModalSeen`/`QuotaWallSeen` and on the checkout events, so each surface can be measured on its own.
 - A 402 outside the main clip flow calls `lib/api.openQuotaWall(err, source)`; the app shell listens for it and opens the quota wall instead of an error string.
 - The wall's "this video is N min long" copy only applies when the user still has at least a minute: the pre-probe 402 sends a floor of 1 for `minutes_required`, which is not a duration.
+- A subscriber who runs out of plan minutes gets the wall with the one-time packs as the main action (`packsFirst`): no plan cards (the checkout refuses a second plan), and the copy names the day the plan's minutes come back (`me.period_end`). `QuotaWallSeen` and the checkout events carry `account_plan`.
+- The sign-in modal leads with Google when it is enabled and names the stashed plan and its price (`LoginModalSeen`, `LoginMethodChosen`).
 - A plan picked while signed out is stashed (`lib/pendingPlan.js`, two-hour TTL). `#/pricing` opens the sign-in at once, AuthContext sends the new session back to `#/pricing`, and the section opens that checkout (`CheckoutStarted` with `resumed=1`).
 - `#/pricing?plan=<plan>[&interval=year]` opens that plan's checkout (through the sign-in when signed out) and drops the param afterwards.
 - Emails link to `#/pricing?src=email_<kind>`; checkouts from there are tagged `pricing_email_<kind>`. In nginx, `/pricing?<query>` redirects to the picker at `/#/pricing?<query>`; a bare `/pricing` goes to the homepage plan table (`/#pricing`).
@@ -134,6 +136,10 @@ with the account) and flips the local row, so the webhook sees no transition and
 the generic churn alert does not fire twice. The alert names the reason and
 rating, never the written text (see `alerts.user_ref`): read reviews in the
 table.
+
+The offer is worded in money and dates (each renewal's price with and without
+the discount, the day it starts, nothing charged or refunded today), and the
+confirm step says the library stops being permanent once the plan ends.
 
 The last step leads with a retention offer (`RETENTION_COUPON_ID` env):
 `GET /api/billing/retention-offer` says whether this subscription gets it (live
@@ -205,6 +211,39 @@ free text: anything typed would land in a row designed to outlive the user.
 still exists before inserting; otherwise the FK violation makes Stripe retry the
 same doomed event for days.
 
+## Paid jobs keep their source for 30 days (`cloud/source_archive.py`)
+
+The server keeps a job's source an hour at most (less under the disk caps);
+without it the preview stops and the editor answers 409 to a cut past the
+original range or a reframe. For an owner on a live paid plan when the job is
+delivered (`metering.live_plans`, plan not `free`), `app._archive_source_bg`
+uploads it to `users/<uid>/<job>/source/<random hex>.<ext>` after the clip
+archive, as a background task (at most `UPLOAD_CONCURRENCY` = 2 uploads per
+process, the file opened before queueing so a sweep cannot pull it away). A
+missing source or a failed upload is logged and nothing else; the delivery
+never waits for it.
+
+- **Erasure and purges** take it by prefix with no code of their own (account
+  erasure, lapsed and free purges). The project restore skips it
+  (`is_source_key`): a reopened project must not pull hundreds of MB.
+- **Back on demand**: `/api/source` redirects (307, `no-store`) to a one-hour
+  R2 link when the file is not on disk, after the same owner/signature checks
+  as before, and `/api/source-url` still mints for a job whose directory is
+  gone when the server knows its owner and the source is archived; `/edl`
+  reports it available with the duration stored as object
+  metadata; `/rerender` (only off the fast path), `/scenes` and `/reframe`
+  download it into the job dir as `.source_archive.<ext>` through
+  `app._locate_or_fetch_source` (one download per job, off the loop). The
+  owner is always the one the server knows for the job, never one the caller
+  names.
+- **Expiry** without a table: `purge_expired_sources`, on the retention
+  sweeper but at most once a day, lists the bucket and deletes source objects
+  older than `SOURCE_ARCHIVE_DAYS` (default 30) by their LastModified. `0`
+  turns uploads off and lets the next sweep delete what is left.
+- **The random name** is the lock on a public custom domain
+  (`R2_PUBLIC_BASE`): a clip URL shows the user and job ids, which must not be
+  enough to fetch the original.
+
 ## Support-ops API (`cloud/support_ops.py`)
 
 A private API for the support back-office under `/api/support-ops/v1`: look up an
@@ -246,3 +285,17 @@ recent activity (`GET /users/{id}/activity`) and fix it with one action at a tim
   performance) with a one-sentence `CONSENT_MESSAGE`.
 - Checkout buttons reset their spinner on a back/forward-cache restore
   (`lib/backFromStripe.js`); without it every plan stayed disabled after Back.
+
+## Social posting and connecting are paid
+
+Free accounts used to connect their channels through the managed Upload-Post
+account freely, and thousands of YouTube channels of accounts that never
+posted filled that account's platform quota. Now:
+
+- `POST /api/social/connect` (the connect page, the scheduling calendar)
+  answers a free account with a 402 `connect_requires_plan`
+  (`cloud/social_profiles.require_paid_plan_to_connect`). A subscription or
+  bought minutes count as paid. The dashboard opens the plans modal in its
+  `connect_wall` context (events `ConnectWallSeen` / `ConnectWallCheckout`).
+- A free account that connected before keeps `FREE_SOCIAL_POSTS` posts in
+  total, then a 402 `post_requires_plan` (`post_wall` context).

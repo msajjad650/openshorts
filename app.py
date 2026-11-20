@@ -23,10 +23,11 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
 from contextlib import asynccontextmanager, suppress
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (HTMLResponse, FileResponse, JSONResponse, StreamingResponse,
+                               RedirectResponse, Response)
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
@@ -36,6 +37,7 @@ import watermarked
 import media_auth
 import remote_worker
 import yt_account
+import api_role as _api_role
 from jsonfile import write_json_atomic
 
 load_dotenv()
@@ -64,6 +66,12 @@ TIKTOK_POST_MODE = os.environ.get("TIKTOK_POST_MODE", "MEDIA_UPLOAD").strip()
 # age-based sweep alone can't stop a burst of long videos from filling the disk.
 # 0 disables the cap.
 OUTPUT_MAX_GB = int(os.environ.get("OUTPUT_MAX_GB", "25"))
+# A job dir touched this recently is left alone by the size cap. Where the
+# jobs still queued or running hold more than the cap by themselves, the cap
+# purged every finished job at the next sweep: an edit made minutes after the
+# clips were ready lost its files before its archive upload ended, and a
+# project restored from the library was purged again while it was open.
+OUTPUT_CAP_GRACE_SECONDS = int(os.environ.get("OUTPUT_CAP_GRACE_SECONDS", "1800"))
 # Same idea for source uploads, which are the biggest single files on disk.
 UPLOADS_MAX_GB = int(os.environ.get("UPLOADS_MAX_GB", "15"))
 # Pre-flight quality gate: warn before processing a YouTube source below this
@@ -154,6 +162,7 @@ DEBUG_LOGS = os.environ.get("DEBUG_LOGS", "").lower() in ("1", "true", "yes")
 if BILLING_ENABLED:
     import cloud
     from cloud import managed_keys, metering as _metering, config as _cloud_config, alerts as _alerts
+    from cloud import source_archive as _source_archive
     from cloud.auth import get_current_user_optional
 else:
     cloud = None
@@ -161,6 +170,7 @@ else:
     _metering = None
     _cloud_config = None
     _alerts = None
+    _source_archive = None
 
     async def get_current_user_optional(request: Request):
         # No-op dependency in self-host mode: every request is anonymous / BYOK.
@@ -497,6 +507,7 @@ def _discard_rejected_source(input_path, job_output_dir, upload_slot=None, uploa
             pass
     if job_output_dir:
         shutil.rmtree(job_output_dir, ignore_errors=True)
+        _end_job_dir(os.path.basename(str(job_output_dir).rstrip(os.sep)))
 
 
 def _parse_source_range(start, end):
@@ -619,6 +630,33 @@ def _begin_submission(job_id, owner_id):
 
 def _end_submission(job_id):
     _submissions.pop(str(job_id), None)
+
+
+# job_id -> monotonic start for /api/process requests that created their job
+# dir and are not in `jobs` yet. The source can take minutes to stream in, and
+# the disk sweeps run meanwhile: a size cap over its limit deleted the half-
+# written upload and the empty dir under the request. Entries end when the job
+# is registered or refused; the age cap only covers a request that died.
+_dirs_in_flight: dict = {}
+_DIR_IN_FLIGHT_MAX_AGE = 3 * 3600
+
+
+def _begin_job_dir(job_id):
+    _dirs_in_flight[str(job_id)] = time.monotonic()
+
+
+def _end_job_dir(job_id):
+    _dirs_in_flight.pop(str(job_id), None)
+
+
+def _job_dir_in_flight(job_id) -> bool:
+    started = _dirs_in_flight.get(str(job_id))
+    if started is None:
+        return False
+    if time.monotonic() - started > _DIR_IN_FLIGHT_MAX_AGE:
+        _dirs_in_flight.pop(str(job_id), None)
+        return False
+    return True
 
 
 def _submissions_in_flight(owner_id) -> int:
@@ -775,6 +813,19 @@ def free_queue_full_error() -> HTTPException:
     return payment_required("free_queue_full", FREE_QUEUE_FULL_MESSAGE, retry_later=True)
 
 
+def _slow_lane_of(request, user, balance) -> bool:
+    """Whether a submission of this account from this client joins the slow
+    lane: a free-plan account with no top-up credit from a slow-lane country,
+    with the mode on."""
+    if not _saturation_on() or user.plan != "free":
+        return False
+    if float(balance.get("topup_remaining") or 0) > 0:
+        return False
+    country = _queue_mode.request_country(
+        request.headers, request.client.host if request.client else None)
+    return _queue_mode.lane_for(user.plan, country) == _queue_mode.SLOW
+
+
 def _assign_queue_lane(request, user, balance, priority) -> int:
     """The lane of a new managed job (``request.state.queue_lane``) and its
     queue priority. Slow only for a free-plan account with no top-up credit
@@ -793,11 +844,9 @@ def _assign_queue_lane(request, user, balance, priority) -> int:
     if float(balance.get("topup_remaining") or 0) > 0:
         request.state.queue_topup = True
         return min(priority, _queue_mode.PAID_PRIORITY)
-    country = _queue_mode.request_country(
-        request.headers, request.client.host if request.client else None)
-    lane = _queue_mode.lane_for(user.plan, country)
-    if lane != _queue_mode.SLOW:
+    if not _slow_lane_of(request, user, balance):
         return priority
+    lane = _queue_mode.SLOW
     if _queue_mode.brake_active():
         _queue_mode.note_rejected()
         # Who was refused, by account prefix only (no address, no country):
@@ -1895,6 +1944,27 @@ MAX_RESUME_ATTEMPTS = 2
 #     under the Coolify stop grace period — before letting uvicorn exit.
 INSTANCE_ID = os.environ.get("INSTANCE_ID") or socket.gethostname()
 _INSTANCE_MARKER = ".instance"
+
+
+def _deploy_generation(env=os.environ) -> str:
+    """Which deploy this container belongs to, comparable as text: the newer
+    deploy has the larger value. DEPLOY_GENERATION, else the timestamp Coolify
+    puts at the end of the container name (<app>-20261118T204041). Empty when
+    unknown (self-host): the marker then works as before, the last to boot is
+    the newer one."""
+    gen = (env.get("DEPLOY_GENERATION") or "").strip()
+    if gen:
+        return gen
+    m = re.search(r"-(\d{8}T\d{6})$", env.get("COOLIFY_CONTAINER_NAME") or "")
+    return m.group(1) if m else ""
+
+
+# 18-nov-2026: the old container of a deploy, draining, had its process killed
+# by the kernel (host out of memory); Docker restarted it, it booted and wrote
+# the marker, and the NEW container read that as "a newer instance is up" and
+# drained for good: nobody started jobs. The marker now carries the deploy
+# generation, and only a newer (or unknown) deploy makes an instance drain.
+DEPLOY_GENERATION = _deploy_generation()
 HEARTBEAT_EVERY = 10                 # seconds between manifest heartbeats
 HEARTBEAT_STALE_AFTER = 60           # no heartbeat for this long = nobody has it
 RESUME_SCAN_INTERVAL = 30            # seconds between looks for stale manifests
@@ -2146,18 +2216,48 @@ async def _wait_for_shared_gpu():
 def _write_instance_marker():
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # "<id> <generation>": an instance from before the generation existed
+        # reads the whole line as an id that is not its own, and drains.
+        line = f"{INSTANCE_ID} {DEPLOY_GENERATION}".strip()
         with open(os.path.join(OUTPUT_DIR, _INSTANCE_MARKER), "w") as f:
-            f.write(INSTANCE_ID)
+            f.write(line)
     except Exception as e:
         print(f"⚠️ Could not write instance marker: {e}")
 
 
-def _read_instance_marker():
+def _read_instance_marker_full():
+    """``(id, generation)`` of the instance in the marker; (None, "") if none."""
     try:
         with open(os.path.join(OUTPUT_DIR, _INSTANCE_MARKER)) as f:
-            return f.read().strip()
+            parts = f.read().split()
     except Exception:
-        return None
+        return None, ""
+    if not parts:
+        return None, ""
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+def _read_instance_marker():
+    return _read_instance_marker_full()[0]
+
+
+def _marker_holder_is_newer(other_gen: str) -> bool:
+    """Whether the instance in the marker belongs to a newer (or the same)
+    deploy than this one. Without our own generation (self-host) the old rule
+    holds: whoever wrote the marker last is the newer one. A marker with no
+    generation, read by an instance that has one, was written by code from
+    before generations, which can only be an older deploy."""
+    if not DEPLOY_GENERATION:
+        return True
+    if not other_gen:
+        return False
+    return other_gen >= DEPLOY_GENERATION
+
+
+def _newer_deploy_holds_marker() -> bool:
+    other, gen = _read_instance_marker_full()
+    return bool(other) and other != INSTANCE_ID and bool(DEPLOY_GENERATION) \
+        and bool(gen) and gen > DEPLOY_GENERATION
 
 
 def _begin_drain(reason):
@@ -2169,11 +2269,17 @@ def _begin_drain(reason):
 
 
 def _check_instance_marker():
-    """A different id in the marker means a newer instance is up: drain."""
-    other = _read_instance_marker()
+    """Another instance of a newer (or the same) deploy in the marker: drain.
+    One of an older deploy (its container restarted after we took over)
+    gets the marker taken back instead."""
+    other, gen = _read_instance_marker_full()
     if other and other != INSTANCE_ID:
-        _begin_drain(f"newer instance {other} is up")
-        return True
+        if _marker_holder_is_newer(gen):
+            _begin_drain(f"newer instance {other} is up")
+            return True
+        print(f"🚦 Instance {other} of an older deploy ({gen or 'no generation'}) took "
+              f"the marker: taking it back ({DEPLOY_GENERATION}).")
+        _write_instance_marker()
     return False
 
 
@@ -2317,6 +2423,20 @@ def _legacy_submitted_at(job_id, manifest_mtime=None):
     return manifest_mtime if manifest_mtime else time.time()
 
 
+def _manifest_reservation_ids() -> set:
+    """Reservation ids of every resume manifest on disk, read-only."""
+    out = set()
+    for job_id in _manifest_names():
+        try:
+            with open(_manifest_path(job_id)) as f:
+                m = json.load(f)
+        except Exception:
+            continue
+        if isinstance(m, dict) and m.get("reservation_id"):
+            out.add(str(m["reservation_id"]))
+    return out
+
+
 def _resume_candidates(held: set, now: float):
     """Disk part of the resume scan (a worker thread on the periodic scan):
     ``(keep_reservations, [(job_id, manifest)])``. ``held`` is a copy of the
@@ -2379,6 +2499,25 @@ def _resume_candidates(held: set, now: float):
     return keep_reservations, picked
 
 
+# Free-plan jobs render at up to FREE_MAX_FPS (0 = source rate): the cut that
+# every later pass reads is made at that rate (ffmpeg_utils.cut_rate_filter),
+# so a 60 fps source costs about half the decoder and encoder time. Paid plans
+# keep the source's rate.
+def _free_max_fps() -> int:
+    try:
+        return max(0, int(os.environ.get("FREE_MAX_FPS", "30")))
+    except ValueError:
+        return 30
+
+
+def _apply_rate_cap(env) -> None:
+    cap = _free_max_fps() if env.get("WATERMARK") == "1" else 0
+    if cap:
+        env["CUT_MAX_FPS"] = str(cap)
+    else:
+        env.pop("CUT_MAX_FPS", None)
+
+
 def _register_resumed(picked) -> int:
     """Loop part of the resume scan: a record and a heap entry per picked
     manifest. The heap orders them by submission time, whatever order the
@@ -2409,6 +2548,7 @@ def _register_resumed(picked) -> int:
             env["WATERMARK"] = "1"
         else:
             env.pop("WATERMARK", None)
+        _apply_rate_cap(env)
         partial = m.get("partial")
         _apply_source_cut(env, partial)
         if m.get("source_cap_minutes"):
@@ -2747,7 +2887,7 @@ def _job_is_active(job_id, now=None) -> bool:
     """True while a job is queued or running here, or its resume manifest says
     it has not reached a terminal state yet (the other instance's jobs during a
     handover included). The disk sweeps must never touch such a job."""
-    if job_id in _running_jobs or job_id in _delivering_jobs:
+    if job_id in _running_jobs or job_id in _delivering_jobs or _job_dir_in_flight(job_id):
         return True
     if (jobs.get(job_id) or {}).get('status') in ('queued', 'processing'):
         return True
@@ -2823,6 +2963,39 @@ def _upload_job_id(filename: str) -> str:
     return filename.split("_", 1)[0]
 
 
+def _upload_is_live(filename: str, now=None) -> bool:
+    """A source the sweeps must keep: its job is live, or it is an agent
+    upload slot (``pending_<upload_id>_<name>``) that has not expired, still
+    streaming in or waiting for /api/process. _sweep_pending_uploads expires
+    those slots."""
+    if filename.startswith("pending_"):
+        slot = pending_uploads.get(_upload_job_id(filename[len("pending_"):]))
+        return slot is not None and (time.time() if now is None else now) - slot["created"] <= UPLOAD_TTL_SECONDS
+    return _job_is_active(_upload_job_id(filename), now)
+
+
+def _output_jobs_size() -> int:
+    """Bytes under OUTPUT_DIR that the size cap can free: the job dirs (and
+    loose files), not the dot entries. Those are never purged by it, and one
+    of them is the download cache (``.source_cache``, source_cache.py) with a
+    cap of its own: counting it here would purge finished jobs to make room
+    for files this cap may not delete."""
+    total = 0
+    try:
+        names = os.listdir(OUTPUT_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        if _not_a_job_dir(name):
+            continue
+        path = os.path.join(OUTPUT_DIR, name)
+        try:
+            total += _dir_size(path) if os.path.isdir(path) else os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
 def _not_a_job_dir(name) -> bool:
     """Dot entries of OUTPUT_DIR are the instances' shared state, never a job:
     the country database (``.geoip/``), the queue watch and mode files, the
@@ -2858,17 +3031,31 @@ def _sweep_expired_uploads(now):
         file_path = os.path.join(UPLOAD_DIR, filename)
         try:
             if (now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS
-                    and not _job_is_active(_upload_job_id(filename), now)):
+                    and not _upload_is_live(filename, now)):
                 os.remove(file_path)
         except Exception:
             pass
+
+
+def _job_dir_is_fresh(job_id, now=None) -> bool:
+    """The job's output dir was written within OUTPUT_CAP_GRACE_SECONDS: its
+    clips just came out or someone is editing them, so the size caps leave
+    the job and its source alone."""
+    try:
+        mtime = os.path.getmtime(os.path.join(OUTPUT_DIR, job_id))
+    except OSError:
+        return False
+    return (time.time() if now is None else now) - mtime < OUTPUT_CAP_GRACE_SECONDS
 
 
 def _enforce_uploads_size_cap():
     """Delete the oldest source uploads while UPLOAD_DIR is over UPLOADS_MAX_GB.
 
     Sources are only needed while a job runs (and for the preview afterwards),
-    but they're the biggest files on disk — up to MAX_FILE_SIZE_MB each.
+    but they're the biggest files on disk — up to MAX_FILE_SIZE_MB each. The
+    source of a job whose clips are fresh stays (_job_dir_is_fresh): with the
+    queued jobs alone over the cap, every upload went minutes after its job
+    ended, and with it the source preview and every edit that cuts from it.
     """
     cap = UPLOADS_MAX_GB * 1024 ** 3
     if cap <= 0:
@@ -2879,7 +3066,8 @@ def _enforce_uploads_size_cap():
     files = []
     for name in os.listdir(UPLOAD_DIR):
         p = os.path.join(UPLOAD_DIR, name)
-        if os.path.isfile(p) and not _job_is_active(_upload_job_id(name)):
+        if (os.path.isfile(p) and not _upload_is_live(name)
+                and not _job_dir_is_fresh(_upload_job_id(name))):
             try:
                 files.append((os.path.getmtime(p), p, os.path.getsize(p)))
             except OSError:
@@ -2898,14 +3086,17 @@ def _enforce_uploads_size_cap():
 
 
 def _enforce_output_size_cap():
-    """Delete the oldest job dirs while OUTPUT_DIR is over OUTPUT_MAX_GB."""
+    """Delete the oldest job dirs while OUTPUT_DIR is over OUTPUT_MAX_GB.
+    Live jobs and dirs touched within OUTPUT_CAP_GRACE_SECONDS are kept, so
+    the directory can sit over the cap by what those hold."""
     cap = OUTPUT_MAX_GB * 1024 ** 3
     if cap <= 0:
         return
-    used = _dir_size(OUTPUT_DIR)
+    used = _output_jobs_size()
     if used <= cap:
         return
     thumbs = os.path.basename(THUMBNAILS_DIR)
+    fresh_after = time.time() - OUTPUT_CAP_GRACE_SECONDS
     candidates = []
     for job_id in os.listdir(OUTPUT_DIR):
         if job_id == thumbs or _not_a_job_dir(job_id):
@@ -2913,9 +3104,11 @@ def _enforce_output_size_cap():
         p = os.path.join(OUTPUT_DIR, job_id)
         if os.path.isdir(p) and not _job_is_active(job_id):
             try:
-                candidates.append((os.path.getmtime(p), p, job_id))
+                mtime = os.path.getmtime(p)
             except OSError:
-                pass
+                continue
+            if mtime <= fresh_after:
+                candidates.append((mtime, p, job_id))
     candidates.sort()  # oldest first
     print(f"🧹 Output dir at {used / 1024**3:.1f} GB (cap {OUTPUT_MAX_GB} GB) — trimming.")
     for _mtime, path, job_id in candidates:
@@ -2969,9 +3162,11 @@ async def cleanup_jobs():
             
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
-            _sweep_expired_job_dirs(now)
+            # Disk walks and rmtree of whole job dirs: in a thread, so the
+            # API keeps answering while they run.
+            await asyncio.to_thread(_sweep_expired_job_dirs, now)
 
-            for job_id in _sweep_retained_sources(now):
+            for job_id in await asyncio.to_thread(lambda: list(_sweep_retained_sources(now))):
                 print(f"🧹 Dropped retained source for job {job_id}")
 
             # Hard disk cap. The time-based sweep above bounds the *age* of what
@@ -2979,8 +3174,8 @@ async def cleanup_jobs():
             # inside one retention window. Drop the oldest jobs until we're back
             # under the cap — clips are already archived to R2 and get restored
             # on demand, so this only costs a re-download.
-            _enforce_output_size_cap()
-            _enforce_uploads_size_cap()
+            await asyncio.to_thread(_enforce_output_size_cap)
+            await asyncio.to_thread(_enforce_uploads_size_cap)
 
             # Cleanup SaaSShorts jobs from memory
             try:
@@ -3009,18 +3204,22 @@ async def cleanup_jobs():
 
 BRAKE_CLIPS_LOG = ("⏳ The free queue is very busy right now, so this video gets its "
                    "{n} best clips. Plans get every clip and skip the line.")
+FREE_CLIPS_LOG = ("⏳ On the free plan a video gets its {n} best clips. "
+                  "Plans get every clip and skip the line.")
 
 
-def _apply_brake_clips(job):
+def _apply_brake_clips(job, cap=None, log=BRAKE_CLIPS_LOG):
     """A slow-lane free job dispatched while the brake is on renders at most
     ``SLOW_LANE_BRAKE_CLIPS`` clips. Through ``CLIP_TARGET_MIN/MAX`` like the
     user's own ``target_clips``: the scoring pass still ranks every window,
     the floor stays enforced in code (here equal to the cap) and the extra
     clips are dropped by score (``trim_to_best``). Decided at dispatch, so a
-    job resumed after the brake let go gets the full set."""
+    job resumed after the brake let go gets the full set. ``cap``/``log``:
+    another cap decided at dispatch (``_cap_clips_at_dispatch``)."""
     if not job or job.get('env') is None:
         return
-    cap = _queue_mode.limits()["brake_clips"]
+    if cap is None:
+        cap = _queue_mode.limits()["brake_clips"]
     env = job['env']
     try:
         cap = min(cap, int(env["CLIP_TARGET_MAX"])) if env.get("CLIP_TARGET_MAX") else cap
@@ -3032,7 +3231,27 @@ def _apply_brake_clips(job):
     job['clips_capped'] = cap
     logs = job.get('logs')
     if logs is not None:
-        logs.append(BRAKE_CLIPS_LOG.format(n=cap))
+        logs.append(log.format(n=cap))
+
+
+def _cap_clips_at_dispatch(job, priority):
+    """The clip caps of a free job, decided when it is dispatched (here or to
+    the remote worker) so a job already waiting gets today's setting: the
+    free plan's own cap (``FREE_MAX_CLIPS``, or ``FREE_QUIET_MAX_CLIPS`` while
+    the queue is short; never a job that carries no mark
+    or whose owner bought a top-up) and the slow lane's brake, whichever is
+    lower."""
+    if not job or priority is None or priority < _queue_mode.FREE_PRIORITY:
+        return
+    cap, log = 0, FREE_CLIPS_LOG
+    if job.get('watermark') and not job.get('topup'):
+        cap = _queue_mode.free_clip_cap()
+    if priority >= _queue_mode.SLOW_PRIORITY and _queue_mode.brake_active():
+        brake = _queue_mode.limits()["brake_clips"]
+        if not cap or brake < cap:
+            cap, log = brake, BRAKE_CLIPS_LOG
+    if cap:
+        _apply_brake_clips(job, cap, log)
 
 
 async def process_queue():
@@ -3068,8 +3287,7 @@ async def process_queue():
                 print(f"⏸️ Draining — leaving {job_id} for the next instance.")
                 continue
             print(f"🔄 Acquired slot for job: {job_id}")
-            if _priority >= _queue_mode.SLOW_PRIORITY and _queue_mode.brake_active():
-                _apply_brake_clips(jobs.get(job_id))
+            _cap_clips_at_dispatch(jobs.get(job_id), _priority)
             _running_jobs.add(job_id)
             if job_id in jobs:
                 jobs[job_id]['run_started'] = time.time()
@@ -3495,6 +3713,42 @@ async def _archive_managed_job(job_id):
         await cloud.videos.archive_job(job['user_id'], job_id, clips, job['output_dir'])
     except Exception as e:
         print(f"⚠️  R2 archive error for {job_id}: {e}")
+    _archive_source_bg(job_id, job)
+
+
+_source_archive_tasks: set = set()
+
+
+def _archive_source_bg(job_id, job):
+    """Upload a paid job's source to R2 for SOURCE_ARCHIVE_DAYS, in the
+    background (``cloud/source_archive.py``).
+
+    Never awaited by the delivery: the clips are ready, and a source of
+    hundreds of MB must not hold the job in 'processing' nor a delivery slot.
+    The plan check, the open and the upload all happen in the task; at most
+    ``UPLOAD_CONCURRENCY`` uploads run at once in the process. A drain or a
+    restart that cuts it short loses only this copy: the job is delivered.
+    """
+    if not BILLING_ENABLED or _source_archive is None or not _source_archive.enabled():
+        return
+    owner = job.get('user_id')
+    if owner is None or not _JOB_ID_RE.match(job_id or ""):
+        return
+    path = _locate_source(job_id)
+    if not path:
+        print(f"ℹ️  No source on disk to archive for {job_id}.")
+        return
+
+    async def _run():
+        try:
+            await _source_archive.archive_source(
+                owner, job_id, path, duration_probe=_source_duration_seconds)
+        except Exception as e:
+            print(f"⚠️  Source archive error for {job_id}: {e}")
+
+    task = asyncio.create_task(_run())
+    _source_archive_tasks.add(task)
+    task.add_done_callback(_source_archive_tasks.discard)
 
 
 async def _unmark_if_owner_paid(job_id, job):
@@ -3536,12 +3790,18 @@ def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
     if not user_id:
         return
     output_dir = os.path.join(OUTPUT_DIR, job_id)
+    # The local file is already the new one and storage is not yet: nobody is
+    # sent there for this job until the upload has reported back.
+    from cloud import media_redirect
+    media_redirect.hold(job_id)
 
     async def _run():
         try:
             await cloud.videos.archive_clip_edit(user_id, job_id, clip_index, output_dir, filename)
         except Exception as e:
             print(f"⚠️  R2 edit archive error for {job_id}: {e}")
+        finally:
+            media_redirect.forget(job_id)
 
     asyncio.create_task(_run())
 
@@ -3621,10 +3881,9 @@ async def _notify_clip_activity(job_id):
             sub = await metering._active_subscription(s, user.id)
         if sub is None:
             return
-        title = clips[0].get('video_title_for_youtube_short') or clips[0].get('title') or "video"
-        n = len(clips)
-        await _alerts.send_telegram(
-            f"🎬 Clips created\n{user.email} ({sub.plan}) — “{title}” ({n} clip{'s' if n != 1 else ''})")
+        # Counted in the daily digest; never the user's email or the video's
+        # title (personal data in a chat run from outside the EEA, alerts.user_ref).
+        await _alerts.notify(f"🎬 Clips created by a paying user ({sub.plan})")
     except Exception as e:
         print(f"⚠️  Clip-activity notify error for {job_id}: {e}")
 
@@ -4067,16 +4326,35 @@ def _queue_wait_started(job_id):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if _api_role.is_front():
+        # A front process of a split API (front.py) serves only routes that
+        # need none of the engine's memory: no queue, no jobs, no handover,
+        # no sweeps or background loops here. The engine of the same
+        # container runs all of that once.
+        if BILLING_ENABLED:
+            await cloud.setup_front()
+            # An alert held here reaches the engine's digest through the file.
+            _alerts.configure_digest(OUTPUT_DIR)
+        yield
+        return
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
     # Re-enqueue jobs that were mid-processing when we stopped (redeploy). Their
     # reservations must survive the orphan sweep so the resumed run can settle them.
     _booted_at = datetime.now(timezone.utc)
-    _resumed_reservation_ids = _resume_interrupted_jobs()
-    # Deploy handover: claim the marker (any older instance sees it and drains),
-    # keep watching it in case a newer one appears, keep looking for manifests
-    # left behind, and drain instead of dying on docker stop.
-    _write_instance_marker()
+    if _newer_deploy_holds_marker():
+        # This container is the old one of a deploy, restarted (crash, OOM
+        # kill) after the new one took over: the queue is the new one's.
+        _begin_drain(f"a newer deploy holds the marker ({_read_instance_marker()})")
+        # Adopt nothing, but keep every reservation on disk out of the orphan
+        # refund below: those jobs are the newer instance's, alive.
+        _resumed_reservation_ids = _manifest_reservation_ids()
+    else:
+        _resumed_reservation_ids = _resume_interrupted_jobs()
+        # Deploy handover: claim the marker (any older instance sees it and
+        # drains), keep watching it in case a newer one appears, keep looking
+        # for manifests left behind, and drain instead of dying on docker stop.
+        _write_instance_marker()
     _install_drain_signal_handler()
     asyncio.create_task(_handover_watch())
     asyncio.create_task(_resume_scan())
@@ -4096,6 +4374,9 @@ async def lifespan(app: FastAPI):
     # The worker starts only now, so the first job it takes off the queue was
     # already ranked by its owner's current plan.
     worker_task = asyncio.create_task(process_queue())
+    if _api_role.is_engine():
+        # The front processes answer /api/status from what this publishes.
+        asyncio.create_task(_status_publisher())
     if BILLING_ENABLED:
         # Account erasure lives in cloud/, which can't import app.py; hand it the
         # one thing only this module can do — wipe the local working files.
@@ -4117,6 +4398,12 @@ async def lifespan(app: FastAPI):
         # a single job-failure alert is easy to miss and ingest stays broken
         # until someone tops the balance up.
         asyncio.create_task(_alerts.proxy_watch_loop())
+        # One Telegram message a day with the figures and every alert that was
+        # not urgent (cloud/alerts.hold); only the active instance sends it.
+        _alerts.configure_digest(OUTPUT_DIR)
+        from cloud import digest as _digest
+        _digest.start_digest(
+            is_active=lambda: not _draining and _read_instance_marker() in (None, INSTANCE_ID))
         # Page when the render queue backs up (paid job waiting, free backlog).
         # Only the newest instance measures; state is shared through output/.
         from cloud import queue_watch as _queue_watch
@@ -4134,8 +4421,33 @@ async def lifespan(app: FastAPI):
                      and not _queue_mode.killed())
     yield
     # Cleanup (optional: cancel worker)
+    if BILLING_ENABLED:
+        # Last chunk of this instance's log to storage (cloud/log_archive.py).
+        await asyncio.to_thread(cloud.log_archive.flush)
 
 app = FastAPI(lifespan=lifespan)
+
+
+class _QuietAccessLog(__import__("logging").Filter):
+    """Drop the access-log line of a successful status poll, config read or
+    remote-worker call: they are most of the traffic, and every line is a
+    write on the event loop (and into the log spool). Errors (>= 400) on
+    those paths are still logged."""
+
+    QUIET_PREFIXES = ("/api/status/", "/api/config", "/internal/worker/")
+
+    def filter(self, record):
+        try:
+            args = record.args
+            if (isinstance(args, tuple) and len(args) >= 5 and int(args[4]) < 400
+                    and str(args[2]).startswith(self.QUIET_PREFIXES)):
+                return False
+        except Exception:
+            pass
+        return True
+
+
+__import__("logging").getLogger("uvicorn.access").addFilter(_QuietAccessLog())
 
 # Cloud mode: attach middleware + routers at import time (before the app serves).
 if BILLING_ENABLED:
@@ -4332,32 +4644,42 @@ def _media_denied():
         "download_url), or send your API key in the Authorization header."))
 
 
-async def _authorize_media(kind: str, path: str, scope) -> None:
-    """``authorize`` hook of the /videos and /thumbnails mounts."""
+async def _authorize_media(kind: str, path: str, scope) -> Optional[str]:
+    """``authorize`` hook of the /videos and /thumbnails mounts. Returns what
+    let the caller in (``_media_redirect`` only acts for the owner)."""
     secret = _media_secret()
     if not secret:
-        return
+        return None
     request = Request(scope)
     params = request.query_params
     cleaned = path.replace("\\", "/").strip("/")
     sig = params.get("sig")
-    if sig and media_auth.verify_path_signature(f"{kind}/{cleaned}", params.get("exp"), sig, secret):
-        return
+    signed = bool(sig and media_auth.verify_path_signature(
+        f"{kind}/{cleaned}", params.get("exp"), sig, secret))
     segment = cleaned.split("/", 1)[0]
+    tokens = [t for t in (params.get("mt"), request.cookies.get(media_auth.MEDIA_COOKIE_NAME)) if t]
+    if signed and not tokens:
+        return "signature"
     owner = await _media_owner(kind, segment)
     if owner is not None:
-        for candidate in (params.get("mt"), request.cookies.get(media_auth.MEDIA_COOKIE_NAME)):
-            if candidate and media_auth.verify_user_token(candidate, secret) == owner:
-                return
+        # Also behind a valid signature: the dashboard plays a fresh job
+        # through the signed links of its status, with the owner's cookie.
+        for candidate in tokens:
+            if media_auth.verify_user_token(candidate, secret) == owner:
+                return "owner"
+        if signed:
+            return "signature"
         if request.headers.get("authorization") or request.headers.get("x-api-key"):
             user = await _user_from_request(request)
             if user is not None and str(user.id) == owner:
-                return
+                return "owner"
+    if signed:
+        return "signature"
     if kind == "videos" and await _media_legacy_ok(segment):
         if segment not in _media_legacy_logged and len(_media_legacy_logged) < 10000:
             _media_legacy_logged.add(segment)
             print(f"🔓 Unsigned /videos link to a pre-signing job served ({segment[:8]}…)")
-        return
+        return "legacy"
     raise _media_denied()
 
 
@@ -4368,6 +4690,58 @@ def _signed_media_url(url_path: str, base: str = "") -> str:
     if not secret:
         return f"{base.rstrip('/')}{url_path}" if base and url_path.startswith("/") else url_path
     return media_auth.sign_absolute_url(base, url_path, secret)
+
+
+# What a browser sends for a player, an image or a link it follows by itself.
+# A script's fetch says "cors" and gets the bytes from here: across two hosts
+# its redirect arrives at storage with no origin, and storage would refuse it.
+_MEDIA_REDIRECT_MODES = frozenset({"no-cors", "navigate"})
+
+
+async def _storage_media_url(owner, job_id: str, filename: str) -> Optional[str]:
+    """The archived copy of a job's file, when storage holds exactly that file
+    (``cloud/media_redirect``); None in self-host and whenever this host has
+    to serve it."""
+    if not BILLING_ENABLED or not owner:
+        return None
+    if not _JOB_ID_RE.match(job_id or "") or not filename or "/" in filename or "\\" in filename:
+        return None
+    from cloud import media_redirect
+    return await media_redirect.storage_url(
+        owner, job_id, filename, local_path=os.path.join(OUTPUT_DIR, job_id, filename))
+
+
+async def _media_redirect(path: str, scope, granted: Optional[str] = None) -> Optional[str]:
+    """``redirect`` hook of the /videos mount. It runs after the guard and
+    the authorization, for a browser's own GET only: an API client, a HEAD and
+    a script's fetch keep getting the file from this host as before. And only
+    for the owner (media token or credentials, with or without a signature):
+    a signed link by itself expires, and the storage link it would be traded
+    for does not."""
+    if granted != "owner" or scope.get("method") != "GET":
+        return None
+    mode = Request(scope).headers.get("sec-fetch-mode", "").strip().lower()
+    if mode not in _MEDIA_REDIRECT_MODES:
+        return None
+    job_id, _, filename = path.replace("\\", "/").strip("/").partition("/")
+    if not filename:
+        return None
+    return await _storage_media_url(await _media_owner("videos", job_id), job_id, filename)
+
+
+@app.get("/api/media-url")
+async def media_url(job_id: str, filename: str, request: Request):
+    """Where the caller can fetch one of their own clips from storage:
+    ``{"url": ...}``, or null when only this host has that file as it is now.
+    The dashboard's download asks here first, so the bytes of a finished clip
+    do not go through the API."""
+    user = await _user_from_request(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    owner = await _media_owner("videos", job_id) if _JOB_ID_RE.match(job_id or "") else None
+    if owner is None or owner != str(user.id) or not _media_guard(f"{job_id}/{filename}"):
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"url": await _storage_media_url(owner, job_id, filename)}
 
 
 @app.post("/api/media-token")
@@ -4402,6 +4776,7 @@ app.mount("/videos", RestoringStaticFiles(
     directory=OUTPUT_DIR,
     guard=_media_guard,
     authorize=lambda path, scope: _authorize_media("videos", path, scope),
+    redirect=lambda path, scope, granted: _media_redirect(path, scope, granted),
     restorer=lambda job_id: _restore_for_public_path(job_id)), name="videos")
 
 # Mount static files for serving thumbnails
@@ -4475,6 +4850,9 @@ class _TimedLog(list):
         self.times.extend([time.time()] * len(lines))
 
 
+_log_fold_lock = threading.Lock()
+
+
 def _visible_logs_timed(logs):
     """(lines, times) to surface to the client; see _visible_logs."""
     times = getattr(logs, "times", None)
@@ -4482,7 +4860,19 @@ def _visible_logs_timed(logs):
         times = None
     if not BILLING_ENABLED or DEBUG_LOGS:
         return list(logs), list(times) if times is not None else None
-    from log_view import friendly_logs_timed
+    from log_view import FriendlyLogFold, friendly_logs_timed
+    if isinstance(logs, _TimedLog):
+        # Polled every 2 s by each open tab: fold only the lines that arrived
+        # since the last poll (the fold lives on the log itself, so it goes
+        # away with the job). A line whose time is not stamped yet (another
+        # thread is between the two appends) waits for the next poll.
+        raw_times = logs.times
+        fold = getattr(logs, "_friendly", None)
+        if fold is None:
+            fold = logs._friendly = FriendlyLogFold()
+        with _log_fold_lock:
+            pairs = fold.feed(logs, raw_times, min(len(logs), len(raw_times))).view()
+        return [p[0] for p in pairs], [p[1] for p in pairs]
     pairs = friendly_logs_timed(logs, times)
     return [p[0] for p in pairs], ([p[1] for p in pairs] if times is not None else None)
 
@@ -4573,12 +4963,20 @@ def _handle_job_line(job_id, line, remote=False):
         return
     if remote and job_id in jobs and len(jobs[job_id]['logs']) >= REMOTE_MAX_LOG_LINES:
         return        # a render prints a few hundred lines; the rest is noise
+    if _DOWNLOADER_CHATTER.match(decoded_line):
+        return
     print(f"📝 [Job Output] {decoded_line}")
     if job_id in jobs:
         jobs[job_id]['logs'].append(decoded_line)
 
 
 REMOTE_MAX_LOG_LINES = 5000
+
+# ffmpeg fetching a segmented (HLS) source says one line per request and per
+# connection: tens of thousands for a long video. They are kept out of the
+# job's log, which every status poll reads from start to end, and out of the
+# server's own log. The downloader's errors and its summary still print.
+_DOWNLOADER_CHATTER = re.compile(r'\[(?:hls|tcp|tls|https?|AVIOContext) @ 0x[0-9a-f]+\] ')
 
 
 def enqueue_output(out, job_id):
@@ -4636,6 +5034,13 @@ async def _paid_proxy_budget_exceeded() -> bool:
         return False
 
 
+# job id -> (metadata mtime, size, clips announced) of the last read that
+# published every announced clip. Ticked every 2 s for every running job,
+# local and remote; the metadata JSON is large, so it is parsed again only
+# when it changed or a new clip was announced.
+_partial_seen: Dict[str, tuple] = {}
+
+
 def _refresh_partial_result(job_id, output_dir):
     """While a job runs: the clips main.py has announced so far, so the user
     sees each one as it lands."""
@@ -4646,7 +5051,12 @@ def _refresh_partial_result(job_id, output_dir):
         target_json = json_files[0]
         # It might be being written to: a partial file fails json.load and
         # the next look reads it whole.
-        if os.path.getsize(target_json) <= 0:
+        st = os.stat(target_json)
+        if st.st_size <= 0:
+            return
+        announced = len((jobs.get(job_id) or {}).get('ready_files') or {})
+        seen_key = (st.st_mtime_ns, st.st_size, announced)
+        if _partial_seen.get(job_id) == seen_key:
             return
         with open(target_json, 'r') as f:
             data = json.load(f)
@@ -4669,6 +5079,10 @@ def _refresh_partial_result(job_id, output_dir):
                 ready_clips.append(clip)
         if ready_clips:
             jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
+        if len(ready_clips) >= announced:
+            if len(_partial_seen) > 5000:
+                _partial_seen.clear()
+            _partial_seen[job_id] = seen_key
     except Exception:
         # Ignore read errors during processing
         pass
@@ -4730,13 +5144,22 @@ async def _run_main(job_id, cmd, env, tick=None):
     called every couple of seconds. Cancelled (the server is stopping): the
     child is killed so it cannot keep writing into the job dir while the next
     instance resumes the same job."""
-    process = subprocess.Popen(
-        cmd,
+    # Started off the event loop and without preexec_fn: a preexec_fn makes
+    # Python fork() this whole process (GPU mappings and all) instead of a
+    # cheap vfork, and that fork stalled every request for a few hundred ms
+    # per job start. The niceness comes from nice(1), which execs the job in
+    # place (same pid, so kill() still reaches main.py).
+    nice = _job_nice()
+    launch = (["nice", "-n", str(nice), *cmd]
+              if nice and shutil.which("nice") else list(cmd))
+    process = await asyncio.to_thread(
+        subprocess.Popen,
+        launch,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, # Merge stderr to stdout
         env=env,
         cwd=os.getcwd(),
-        preexec_fn=_lower_priority,
+        preexec_fn=(_lower_priority if nice and launch[0] != "nice" else None),
     )
     # We need to capture logs in a thread because Popen isn't async
     t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
@@ -4827,9 +5250,10 @@ def _remote_eligible(job_id, priority) -> bool:
     return os.path.exists(_manifest_path(job_id))
 
 
-def _claim_remote_job(worker):
+def _claim_remote_job(worker, source_only=False):
     """Hand the next eligible queued job to the remote worker, or None.
     ``(job_id, claim)``. Loop thread only: it edits the heap.
+    ``source_only``: the worker wants the source alone (it has its own card).
 
     Only while a job is already waiting for a GPU slot: with room on the card
     the job runs here, where it is faster."""
@@ -4862,13 +5286,12 @@ def _claim_remote_job(worker):
                 kind = ""
             job['logs'].append(_expired_log(kind))
             continue
-        if prio >= _queue_mode.SLOW_PRIORITY and _queue_mode.brake_active():
-            _apply_brake_clips(job)
+        _cap_clips_at_dispatch(job, prio)
         _running_jobs.add(job_id)
         _remote_jobs.add(job_id)
         job['run_started'] = time.time()
         _touch_manifest(job_id, started=True)
-        claim = remote_worker.begin(job['output_dir'], worker)
+        claim = remote_worker.begin(job['output_dir'], worker, source_only=source_only)
         print(f"🛰️ Job {job_id} goes to the remote worker {str(worker)[:40]!r}.")
         asyncio.create_task(run_job_wrapper(job_id))
         return job_id, claim
@@ -4886,12 +5309,17 @@ async def _run_job_remote(job_id, job_data):
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
     handed = False               # the worker was given the job (not just a claim)
+    worker_stopped = False       # ...and gave it back because it is restarting
     log_mark = len(job_data['logs'])
     try:
         parsed = remote_worker.worker_args(cmd)
         env = dict(job_data['env'])
         if await _paid_proxy_budget_exceeded():
             env.pop("PROXY_URL", None)
+        if remote_worker.source_only(output_dir):
+            # A worker with a card of its own transcribes and finds the scenes
+            # faster than it can wait for this host to do it for it.
+            env.update(remote_worker.source_only_env(env))
         jobs[job_id].pop('remote_source', None)
         returncode = await _run_main(job_id, cmd + ["--prepare-only"], env)
         source = jobs[job_id].get('remote_source')
@@ -4931,6 +5359,7 @@ async def _run_job_remote(job_id, job_data):
             _refresh_partial_result(job_id, output_dir)
             if done is not None:
                 returncode = done
+                worker_stopped = remote_worker.read_stopping(output_dir)
             elif not remote_worker.is_remote(output_dir):
                 returncode = -15            # the claim was dropped under us
             elif (time.time() - remote_worker.last_seen(output_dir) > REMOTE_LEASE_SECONDS
@@ -4941,6 +5370,11 @@ async def _run_job_remote(job_id, job_data):
                 jobs[job_id]['logs'].append(REMOTE_LOST_LOG)
                 return
         _finish_job(job_id, returncode, output_dir)
+        if returncode == 0:
+            # The worker's run is the job: the transcript and scenes prepared
+            # for it have no reader left (a failed run keeps them for the retry
+            # here).
+            remote_worker.drop_transcript(output_dir)
         if (returncode == 0 and remote_worker.source_is_url(cmd)
                 and "--keep-original" not in cmd):
             with suppress(OSError):
@@ -4958,7 +5392,10 @@ async def _run_job_remote(job_id, job_data):
             # A job that completed is done with its worker even while this
             # instance is being stopped: no claim may outlive the job.
             remote_worker.clear(output_dir, purge=not ok)
-            if handed:
+            # A worker being restarted hands its jobs back: they run again and
+            # say nothing about the worker, so they do not trip the breaker
+            # (a restart used to park the worker for its full 30 minutes).
+            if handed and not worker_stopped:
                 _remote_outcome(ok)
             if not ok:
                 # What the worker printed is not this host's diagnosis: the
@@ -5050,7 +5487,8 @@ async def _worker_body(request: Request) -> dict:
 async def worker_claim(request: Request):
     _worker_auth(request)
     body = await _worker_body(request)
-    claimed = _claim_remote_job(str(body.get("worker") or "worker"))
+    claimed = _claim_remote_job(str(body.get("worker") or "worker"),
+                                source_only=body.get("source_only") is True)
     if claimed is None:
         return JSONResponse({"job_id": None})
     return {"job_id": claimed[0], "claim": claimed[1]}
@@ -5064,7 +5502,39 @@ async def worker_job(job_id: str, request: Request):
         return {"state": remote_worker.PREPARING}
     return {"state": remote_worker.READY, "source": data.get("source"),
             "source_size": data.get("source_size"), "args": data.get("args") or [],
-            "env": data.get("env") or {}}
+            "env": data.get("env") or {},
+            "transcript_size": int(data.get("transcript_size") or 0),
+            "scenes_size": int(data.get("scenes_size") or 0)}
+
+
+@app.get("/internal/worker/jobs/{job_id}/transcript")
+async def worker_transcript(job_id: str, request: Request):
+    """The transcript this host prepared for the job (``main.py
+    --prepare-only``), as data: the worker reuses it instead of transcribing
+    on its CPU. Only for a live claim on a ready job, like the source."""
+    job_dir, data = _worker_job(request, job_id)
+    body = None
+    if data.get("state") == remote_worker.READY:
+        body = await asyncio.to_thread(remote_worker.read_transcript, job_dir)
+    if body is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    remote_worker.touch_seen(job_dir)
+    return Response(content=body, media_type="application/json")
+
+
+@app.get("/internal/worker/jobs/{job_id}/scenes")
+async def worker_scenes(job_id: str, request: Request):
+    """The scene probabilities this host's card prepared for the job's source
+    (``main.prepare_scenes``), as data: the worker maps them onto its clips
+    instead of running TransNetV2 on its CPU. Same rules as the transcript."""
+    job_dir, data = _worker_job(request, job_id)
+    body = None
+    if data.get("state") == remote_worker.READY:
+        body = await asyncio.to_thread(remote_worker.read_scenes, job_dir)
+    if body is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    remote_worker.touch_seen(job_dir)
+    return Response(content=body, media_type="application/json")
 
 
 @app.get("/internal/worker/jobs/{job_id}/source")
@@ -5080,7 +5550,9 @@ async def worker_source(job_id: str, request: Request):
                              headers={"Content-Length": str(os.path.getsize(real))})
 
 
-SOURCE_CHUNK = 1024 * 1024
+# Each chunk is one hop through the event loop: big chunks keep the cost of
+# feeding the remote worker its sources off the API's one core.
+SOURCE_CHUNK = max(256 * 1024, _int_env("SOURCE_CHUNK_BYTES", 4 * 1024 * 1024))
 # REMOTE_SOURCE_MBPS is for all transfers together: when a quiet window ends,
 # up to REMOTE_WORKER_SLOTS sources leave at once for the same link.
 _source_bucket = {"free_at": 0.0}
@@ -5151,12 +5623,23 @@ async def worker_file(job_id: str, request: Request):
         # the room granted below is then really this request's.
         with remote_worker.upload_lock(job_dir):
             rel, tmp, room = remote_worker.open_upload(job_dir, name, offset, file_max, job_max)
-            with open(tmp, "ab") as f:
+            # Disk writes in a thread, 1 MB at a time: written straight from
+            # the loop they stalled every request whenever the disk was busy.
+            f = await asyncio.to_thread(open, tmp, "ab")
+            try:
+                buf = bytearray()
                 async for chunk in request.stream():
                     written += len(chunk)
                     if written > room:
                         raise remote_worker.UploadError(413, "file too large")
-                    f.write(chunk)
+                    buf += chunk
+                    if len(buf) >= 1024 * 1024:
+                        await asyncio.to_thread(f.write, bytes(buf))
+                        buf.clear()
+                if buf:
+                    await asyncio.to_thread(f.write, bytes(buf))
+            finally:
+                await asyncio.to_thread(f.close)
             remote_worker.touch_seen(job_dir)
             if size is not None:
                 remote_worker.finish_upload(
@@ -5172,18 +5655,33 @@ async def worker_file(job_id: str, request: Request):
 @app.post("/internal/worker/jobs/{job_id}/done")
 async def worker_done(job_id: str, request: Request):
     job_dir, data = _worker_job(request, job_id)
-    if data.get("state") != remote_worker.READY:
-        raise HTTPException(status_code=409, detail="The job is not rendering yet.")
+    ready = data.get("state") == remote_worker.READY
     try:
-        returncode = int((await _worker_body(request))["returncode"])
+        body = await _worker_body(request)
+        returncode = int(body["returncode"])
     except Exception:
+        if not ready:
+            raise HTTPException(status_code=409, detail="The job is not rendering yet.")
         raise HTTPException(status_code=400, detail="returncode required")
-    remote_worker.mark_done(job_dir, returncode)
+    stopping = returncode != 0 and body.get("stopping") is True
+    if not ready and not stopping:
+        raise HTTPException(status_code=409, detail="The job is not rendering yet.")
+    # A worker that is being restarted hands back every job it holds, also
+    # the ones whose source this host is still preparing: refused, those
+    # stayed claimed by nobody until the lease ran out and each counted as a
+    # failure of the worker (a restart parked it for the breaker's 30 min).
+    remote_worker.mark_done(job_dir, returncode, stopping=stopping)
     return {"ok": True}
 
 
+# Fixed for the life of the process (env only), and asked for by every page
+# load: the browser may reuse it for a few minutes.
+PUBLIC_CONFIG_CACHE = "public, max-age=300"
+
+
 @app.get("/api/config")
-async def get_config():
+async def get_config(response: Response):
+    response.headers["Cache-Control"] = PUBLIC_CONFIG_CACHE
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
@@ -5268,6 +5766,7 @@ async def _quality_gate(url: str, force_low: bool):
 async def _drop_unstarted_job(reservation_id, job_output_dir):
     """Undo a submission refused after its minutes were reserved."""
     _end_submission(os.path.basename(str(job_output_dir or "").rstrip(os.sep)))
+    _end_job_dir(os.path.basename(str(job_output_dir or "").rstrip(os.sep)))
     if reservation_id:
         try:
             await _metering.release_reservation(reservation_id)
@@ -5402,6 +5901,13 @@ async def create_upload(request: Request):
     }
 
 
+def _remove_if_present(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
 @app.put("/api/uploads/{upload_id}")
 async def put_upload(upload_id: str, request: Request):
     """Receive the raw video body for a reserved slot. Streams to disk, capped
@@ -5417,16 +5923,16 @@ async def put_upload(upload_id: str, request: Request):
             size += len(chunk)
             if size > limit_bytes:
                 out.close()
-                os.remove(slot["path"])
+                _remove_if_present(slot["path"])
                 raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
             out.write(chunk)
     if size == 0:
-        os.remove(slot["path"])
+        _remove_if_present(slot["path"])
         raise HTTPException(status_code=400, detail="Empty body")
     slot.update({"bytes": size, "complete": True})
     duration = await asyncio.get_event_loop().run_in_executor(None, _media_duration_seconds, slot["path"])
     if duration <= 0:
-        os.remove(slot["path"])
+        _remove_if_present(slot["path"])
         slot["complete"] = False
         raise HTTPException(status_code=400, detail="The body is not a readable video file")
     return {"upload_id": upload_id, "bytes": size, "duration_seconds": round(duration, 1),
@@ -5527,9 +6033,17 @@ async def process_estimate(req: EstimateRequest, request: Request):
     if not managed_keys.has_active_entitlement(user):
         return {"billing": True, "outcome": None}
     url = (req.url or "").strip()
+    balance = None
     if url:
         minutes = _cached_probe(user.id, url)
         if minutes is None:
+            # An account the slow lane's brake refuses on submit gets no cost
+            # line: its probe would spend a request of a YouTube account on a
+            # job that cannot be queued, and those accounts are what every
+            # download waits for.
+            balance = await _metering.get_balance(user.id)
+            if _slow_lane_of(request, user, balance) and _queue_mode.brake_active():
+                return {"billing": True, "outcome": None}
             # Its own hourly window: pasting a few links must not use up the
             # probes the submit itself needs.
             _check_probe_rate(f"estimate:{user.id}")
@@ -5551,7 +6065,8 @@ async def process_estimate(req: EstimateRequest, request: Request):
         minutes = float(req.seconds) / 60.0
     else:
         raise HTTPException(status_code=400, detail="Send a url or the file's seconds.")
-    balance = await _metering.get_balance(user.id)
+    if balance is None:
+        balance = await _metering.get_balance(user.id)
     processed_before = True
     if balance.get("plan") == "free":
         processed_before = await _metering.has_processed_before(user.id)
@@ -5689,6 +6204,7 @@ async def process_endpoint(
 
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    _begin_job_dir(job_id)  # the sweeps keep its dir and source until it is in `jobs`
     os.makedirs(job_output_dir, exist_ok=True)
 
     # Prepare Command
@@ -5779,9 +6295,9 @@ async def process_endpoint(
         # lookup, the clip editor and the preview treat it exactly like a normal
         # upload; the transcript rides along so the pipeline skips Whisper.
         src = thumb_session["video_path"]
-        src_duration = _media_duration_seconds(src)
+        src_duration = await asyncio.to_thread(_media_duration_seconds, src)
         if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
-            shutil.rmtree(job_output_dir, ignore_errors=True)
+            await asyncio.to_thread(_discard_rejected_source, None, job_output_dir)
             _reject_short_source(src_duration)
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{_clamp_upload_name(os.path.basename(src))}")
         try:
@@ -5800,9 +6316,9 @@ async def process_endpoint(
         # Move the pre-uploaded file under the job's name so it is cleaned up
         # with the job like any other upload; the slot is consumed.
         src = upload_slot["path"]
-        src_duration = _media_duration_seconds(src)
+        src_duration = await asyncio.to_thread(_media_duration_seconds, src)
         if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
-            shutil.rmtree(job_output_dir, ignore_errors=True)
+            await asyncio.to_thread(_discard_rejected_source, None, job_output_dir)
             _reject_short_source(src_duration)
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{upload_slot['filename']}")
         os.replace(src, input_path)
@@ -5823,15 +6339,13 @@ async def process_endpoint(
             while content := await file.read(1024 * 1024): # Read 1MB chunks
                 size += len(content)
                 if size > limit_bytes:
-                    os.remove(input_path)
-                    shutil.rmtree(job_output_dir)
+                    await asyncio.to_thread(_discard_rejected_source, input_path, job_output_dir)
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                 buffer.write(content)
 
-        upload_duration = _media_duration_seconds(input_path)
+        upload_duration = await asyncio.to_thread(_media_duration_seconds, input_path)
         if MIN_SOURCE_SECONDS > 0 and 0 < upload_duration < MIN_SOURCE_SECONDS:
-            os.remove(input_path)
-            shutil.rmtree(job_output_dir, ignore_errors=True)
+            await asyncio.to_thread(_discard_rejected_source, input_path, job_output_dir)
             _reject_short_source(upload_duration)
 
         cmd.extend(["-i", input_path])
@@ -5851,7 +6365,7 @@ async def process_endpoint(
             request, url, input_path, job_id, max_minutes=max_minutes,
             source_range=_parse_source_range(source_start, source_end))
     except BaseException:
-        _discard_rejected_source(input_path, job_output_dir,
+        await asyncio.to_thread(_discard_rejected_source, input_path, job_output_dir,
                                  upload_slot=upload_slot, upload_id=upload_id)
         raise
     if getattr(request.state, "paid_allowed", True) is False:
@@ -5899,6 +6413,7 @@ async def process_endpoint(
         # Free-plan clips carry a burned-in watermark (applied by the main.py
         # subprocess after each clip renders).
         env["WATERMARK"] = "1"
+    _apply_rate_cap(env)
 
     # Absolute-URL base for the webhook payload: explicit env wins (the API may
     # sit behind a proxy whose forwarded headers we can't trust), else what the
@@ -5933,6 +6448,7 @@ async def process_endpoint(
         # A free-plan job paid with top-up minutes queues with the paid plans.
         'topup': bool(getattr(request.state, "queue_topup", False)),
     }
+    _end_job_dir(job_id)  # `jobs` keeps it live now
 
     # Persist the owner so recovered jobs keep their multi-tenant guard after a
     # restart (see _recover_jobs_from_disk).
@@ -6038,8 +6554,183 @@ def _presented_status(job_id, job):
     return job['status']
 
 
+# --- Status snapshots for the front processes (split API) ---------------------
+# With the API split (api_role, serve.py) the front processes answer
+# /api/status from files this engine publishes, so the polls of every open
+# tab never reach the engine's one core. Only jobs still waiting or running
+# have a snapshot (those are the polls: a finished job is read once and the
+# dashboard stops), rewritten when what a poll would show changes, at most
+# every STATUS_PUBLISH_SECONDS; the queue positions of all waiting jobs go in
+# one file with it. A front uses a snapshot only while the queue view says
+# this same instance published it within STATUS_SNAPSHOT_FRESH_SECONDS, so
+# a busy, stopped or draining engine sends the polls back to an engine,
+# which answers from memory or disk as before. Dot files: /videos never
+# serves them, and the remote worker cannot write them (safe_relpath).
+STATUS_SNAPSHOT_FILE = ".status.json"
+QUEUE_VIEW_FILE = ".queue_view.json"
+# Touched every publish (no content): the queue view itself is rewritten only
+# when a position or an ETA changed, so a long quiet queue costs no writes.
+QUEUE_BEAT_FILE = ".queue_view.beat"
+STATUS_PUBLISH_SECONDS = max(0.2, float(os.environ.get("STATUS_PUBLISH_SECONDS", "1") or 1))
+STATUS_SNAPSHOT_FRESH_SECONDS = max(3.0, float(os.environ.get("STATUS_SNAPSHOT_FRESH_SECONDS", "10") or 10))
+_published: Dict[str, tuple] = {}   # job id -> signature of the snapshot on disk
+_queue_view_written: dict = {}      # the last queue view written (publisher thread only)
+_STATUS_VIEW_KEY = "openshorts.status_view"   # ASGI scope key front.py fills
+
+
+def _status_signature(job_id, job):
+    """What a poll would show, cheaply: a change rewrites the snapshot."""
+    result = job.get('result')
+    clips = result.get('clips') if isinstance(result, dict) else None
+    return (_presented_status(job_id, job), len(job.get('logs') or ()),
+            len(clips) if isinstance(clips, list) else -1,
+            json.dumps(job.get('partial'), sort_keys=True, default=str),
+            str(job.get('user_id')))
+
+
+def _status_snapshot(job_id, job):
+    lines, times = _visible_logs_timed(job['logs'])
+    owner = job.get('user_id')
+    return {"instance": INSTANCE_ID,
+            "owner": None if owner is None else str(owner),
+            "status": _presented_status(job_id, job),
+            "logs": lines, "log_times": times,
+            "result": job.get('result'), "partial": job.get('partial')}
+
+
+def _write_status_files(writes, removes, queue_view):
+    """Off the loop: the snapshots that changed, the ones to drop (only if we
+    wrote them: the next instance may own that job now) and the queue view."""
+    for job_id, snap in writes:
+        job_dir = os.path.join(OUTPUT_DIR, job_id)
+        if not os.path.isdir(job_dir):
+            continue
+        try:
+            write_json_atomic(os.path.join(job_dir, STATUS_SNAPSHOT_FILE), snap, default=str)
+        except OSError:
+            pass   # the job dir went away meanwhile
+    for job_id in removes:
+        path = os.path.join(OUTPUT_DIR, job_id, STATUS_SNAPSHOT_FILE)
+        try:
+            with open(path) as f:
+                mine = (json.load(f) or {}).get("instance") == INSTANCE_ID
+            if mine:
+                os.remove(path)
+        except (OSError, ValueError, AttributeError):
+            pass
+    if queue_view is not None:
+        path = os.path.join(OUTPUT_DIR, QUEUE_VIEW_FILE)
+        try:
+            if queue_view != _queue_view_written.get("view") or not os.path.exists(path):
+                write_json_atomic(path, queue_view, default=str)
+                _queue_view_written["view"] = queue_view
+            beat = os.path.join(OUTPUT_DIR, QUEUE_BEAT_FILE)
+            with open(beat, "a"):
+                pass
+            os.utime(beat, None)
+        except OSError:
+            pass
+
+
+async def _publish_statuses():
+    active = not _draining and _read_instance_marker() in (None, INSTANCE_ID)
+    writes, live, queue = [], set(), {}
+    if active:
+        for job_id, job in list(jobs.items()):
+            if job.get('status') not in ('queued', 'processing') or not _JOB_ID_RE.match(job_id):
+                continue
+            live.add(job_id)
+            if job.get('status') == 'queued':
+                q = queue_snapshot(job_id)
+                if q is not None:
+                    queue[job_id] = q
+            sig = _status_signature(job_id, job)
+            if _published.get(job_id) != sig:
+                writes.append((job_id, _status_snapshot(job_id, job)))
+                _published[job_id] = sig
+    removes = [j for j in list(_published) if j not in live]
+    for job_id in removes:
+        _published.pop(job_id, None)
+    view = {"instance": INSTANCE_ID, "jobs": queue} if active else None
+    await asyncio.to_thread(_write_status_files, writes, removes, view)
+
+
+async def _status_publisher():
+    while True:
+        await asyncio.sleep(STATUS_PUBLISH_SECONDS)
+        try:
+            await _publish_statuses()
+        except Exception as e:
+            print(f"⚠️ Status snapshot publish failed: {type(e).__name__}: {e}")
+
+
+_queue_view_cache = {"stamp": None, "data": None}
+
+
+def _queue_view():
+    """The engine's queue view, re-read only when the file changes."""
+    path = os.path.join(OUTPUT_DIR, QUEUE_VIEW_FILE)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+    if _queue_view_cache["stamp"] != stamp:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        _queue_view_cache.update(stamp=stamp, data=data if isinstance(data, dict) else None)
+    return _queue_view_cache["data"]
+
+
+def _publisher_alive() -> bool:
+    try:
+        beat = os.stat(os.path.join(OUTPUT_DIR, QUEUE_BEAT_FILE)).st_mtime
+    except OSError:
+        return False
+    return time.time() - beat <= STATUS_SNAPSHOT_FRESH_SECONDS
+
+
+def front_status_view(job_id):
+    """``(snapshot, queue entry)`` a front process may answer a poll from, or
+    None when only an engine can (no snapshot, a stale one, another
+    instance's, or no live publisher)."""
+    if not _JOB_ID_RE.match(job_id or "") or not _publisher_alive():
+        return None
+    view = _queue_view()
+    if not view:
+        return None
+    try:
+        with open(os.path.join(OUTPUT_DIR, job_id, STATUS_SNAPSHOT_FILE)) as f:
+            snap = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(snap, dict) or snap.get("instance") != view.get("instance"):
+        return None
+    queue = (view.get("jobs") or {}).get(job_id)
+    return snap, (queue if isinstance(queue, dict) else None)
+
+
+async def _status_from_snapshot(request, snap, queue):
+    await _assert_job_owner(request, {"user_id": snap.get("owner")})
+    status = snap.get("status")
+    return {
+        "status": status,
+        "logs": snap.get("logs") or [],
+        "log_times": snap.get("log_times"),
+        "result": _with_download_urls(snap.get("result")),
+        "queue": queue if status == 'queued' else None,
+        "partial": snap.get("partial"),
+    }
+
+
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str, request: Request):
+    front_view = request.scope.get(_STATUS_VIEW_KEY)
+    if front_view is not None:
+        return await _status_from_snapshot(request, *front_view)
     job = jobs.get(job_id)
     if job is None:
         job = _job_view_from_disk(job_id)
@@ -6086,7 +6777,57 @@ def _locate_source(job_id: str):
                     return candidate
     except Exception:
         pass
+    # A paid job's source brought back from R2 (_locate_or_fetch_source): a
+    # fixed dot name, never one read from the job directory.
+    if _source_archive is not None:
+        for candidate in _source_archive.local_candidates(os.path.join(OUTPUT_DIR, job_id)):
+            if os.path.exists(candidate):
+                return candidate
     return None
+
+
+_source_fetch_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def _archived_source(job_id: str):
+    """``{"key", "duration"}`` of this job's source in R2, or None.
+
+    Looked up under the prefix of the job's owner as the server knows it
+    (memory, ``.owner``, the Project row), never one the caller names, so a
+    signed link or an owner check that passed for this job can only ever reach
+    this job's own object. Callers have done that check already.
+    """
+    if (not BILLING_ENABLED or _source_archive is None or not _source_archive.enabled()
+            or not _JOB_ID_RE.match(job_id or "")):
+        return None
+    owner = await _media_owner("videos", job_id)
+    if owner is None:
+        return None
+    return await _source_archive.find(owner, job_id)
+
+
+async def _locate_or_fetch_source(job_id: str):
+    """``_locate_source``, falling back to downloading the archived source into
+    the job directory. Off the loop, and once per job however many requests
+    ask at the same time. The job directory must exist (``_ensure_job_files``
+    runs first in every caller)."""
+    path = _locate_source(job_id)
+    if path or not BILLING_ENABLED or _source_archive is None:
+        return path
+    if not _source_archive.enabled() or not _JOB_ID_RE.match(job_id or ""):
+        return None
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return None
+    lock = _source_fetch_locks.setdefault(job_id, asyncio.Lock())
+    async with lock:
+        path = _locate_source(job_id)
+        if path:
+            return path
+        owner = await _media_owner("videos", job_id)
+        if owner is None:
+            return None
+        return await _source_archive.fetch(owner, job_id, job_dir)
 
 
 # How long a signed source URL stays valid. Long enough to survive an editing
@@ -6138,8 +6879,17 @@ async def get_source_url(job_id: str, request: Request):
         # its owner), so the only callers this turns away are asking about a
         # job that does not exist. Off billing there is nothing to protect and
         # the self-host preview must keep working.
+        #
+        # One exception: a paid job whose directory is gone but whose source is
+        # archived in R2. Its owner is still known (.owner / the Project row),
+        # so the check is the same as for any other job, not a blind mint.
         if BILLING_ENABLED:
-            raise HTTPException(status_code=404, detail="Source not found")
+            owner = await _media_owner("videos", job_id) if _JOB_ID_RE.match(job_id or "") else None
+            if owner is None:
+                raise HTTPException(status_code=404, detail="Source not found")
+            await _assert_disk_job_owner(request, job_id)
+            if await _archived_source(job_id) is None:
+                raise HTTPException(status_code=404, detail="Source not found")
     else:
         await _assert_job_owner(request, record)
     return {"url": _signed_source_url(job_id)}
@@ -6179,6 +6929,14 @@ async def get_source_video(job_id: str, request: Request,
             await _assert_disk_job_owner(request, job_id)
     source_path = _locate_source(job_id)
     if not source_path:
+        # Gone from the server but archived (paid plan): send the player to a
+        # short-lived R2 link instead of pulling hundreds of MB back here just
+        # to stream them out again. Only reached past the checks above.
+        archived = await _archived_source(job_id)
+        if archived is not None:
+            return RedirectResponse(_source_archive.signed_url(archived), status_code=307,
+                                    headers={"Cache-Control": "no-store",
+                                             "Referrer-Policy": "no-referrer"})
         raise HTTPException(status_code=404, detail="Source not found")
     return FileResponse(source_path, media_type="video/mp4")
 
@@ -6318,6 +7076,11 @@ async def _restore_job_files(job_id: str, proj, user_id: str) -> bool:
         else:
             prefix = cloud_storage.job_key(user_id, job_id, "")
             keys = await asyncio.to_thread(cloud_storage.list_keys, prefix)
+            # Never the archived source: hundreds of MB that most reopened
+            # projects never touch; the editor fetches it when it needs it
+            # (_locate_or_fetch_source) and the preview plays it from R2.
+            if _source_archive is not None:
+                keys = [k for k in keys if not _source_archive.is_source_key(k)]
             if not keys:
                 raise HTTPException(status_code=502,
                                     detail="Project files are no longer available")
@@ -6341,17 +7104,20 @@ async def _restore_job_files(job_id: str, proj, user_id: str) -> bool:
             except Exception as e:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 raise HTTPException(status_code=502, detail=f"Restore download failed: {e}")
-            # Owner sidecar keeps the multi-tenant guard after a server restart.
-            with open(os.path.join(tmp_dir, ".owner"), "w") as f:
-                f.write(user_id)
+            def _settle():
+                # Owner sidecar keeps the multi-tenant guard after a server restart.
+                with open(os.path.join(tmp_dir, ".owner"), "w") as f:
+                    f.write(user_id)
+                if os.path.isdir(job_dir):
+                    for fname in os.listdir(tmp_dir):
+                        shutil.move(os.path.join(tmp_dir, fname), os.path.join(job_dir, fname))
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    os.utime(job_dir, None)
+                else:
+                    os.rename(tmp_dir, job_dir)
+            # Moves, a tree removal and a rename: in a thread, not on the loop.
+            await asyncio.to_thread(_settle)
             pulled = True
-            if os.path.isdir(job_dir):
-                for fname in os.listdir(tmp_dir):
-                    shutil.move(os.path.join(tmp_dir, fname), os.path.join(job_dir, fname))
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                os.utime(job_dir, None)
-            else:
-                os.rename(tmp_dir, job_dir)
 
         # Register (or refresh) the in-memory job — same shape as
         # _recover_jobs_from_disk, so every edit endpoint works unchanged.
@@ -6516,9 +7282,16 @@ async def edit_clip(
             editor = VideoEditor(api_key=final_api_key)
             
             # SAFE FILE RENAMING STRATEGY (Avoid UnicodeEncodeError in Docker)
-            # Create a safe ASCII filename in the same directory
-            safe_filename = f"temp_input_{req.job_id}.mp4"
+            # Create a safe ASCII filename in the same directory. Unique per
+            # request: with one name per job, two clips of a job edited at the
+            # same time copied over each other's input while it was being
+            # uploaded, deleted it under the other, and moved each other's
+            # result (a clip could end up with another clip's edit, or none).
+            token = uuid.uuid4().hex[:8]
+            safe_filename = f"temp_input_{req.job_id}_{token}.mp4"
             safe_input_path = os.path.join(OUTPUT_DIR, req.job_id, safe_filename)
+            safe_output_path = os.path.join(
+                OUTPUT_DIR, req.job_id, f"temp_output_{req.job_id}_{token}.mp4")
             
             # Copy original file to safe path
             # (Copy is safer than rename if something crashes, we keep original)
@@ -6556,9 +7329,7 @@ async def edit_clip(
                 has_captions = ("subtitled_" in filename) or ("hook_" in filename) or ("hooked_" in filename)
                 filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript, has_captions=has_captions)
                 
-                # 4. Apply
-                # Use safe output name first
-                safe_output_path = os.path.join(OUTPUT_DIR, req.job_id, f"temp_output_{req.job_id}.mp4")
+                # 4. Apply (safe output name first)
                 editor.apply_edits(safe_input_path, safe_output_path, filter_data)
                 
                 # Move result to final destination (rename works even if dest name has unicode if filesystem supports it, 
@@ -6566,14 +7337,20 @@ async def edit_clip(
                 # Actually, output_path is defined above: f"edited_{filename}"
                 # If filename has unicode, output_path has unicode.
                 # Let's hope shutil.move / os.rename works.
-                if os.path.exists(safe_output_path):
-                    shutil.move(safe_output_path, output_path)
-                
+                # No file is a failed edit, not a finished one: answering 200
+                # here left the clip pointing at a video that was never
+                # written, and every later action on it (post, download,
+                # restyle) failed on a missing file.
+                if not os.path.exists(safe_output_path) or os.path.getsize(safe_output_path) == 0:
+                    raise RuntimeError("the edit produced no video")
+                shutil.move(safe_output_path, output_path)
+
                 return filter_data
             finally:
-                # Cleanup temp safe input
-                if os.path.exists(safe_input_path):
-                    os.remove(safe_input_path)
+                # Cleanup the temp copies, whatever happened.
+                for temp_path in (safe_input_path, safe_output_path):
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
 
         # Run in thread pool
         loop = asyncio.get_event_loop()
@@ -6785,6 +7562,11 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
 
     source_path = _locate_source(job_id)
     source_duration = _source_duration_seconds(source_path) if source_path else None
+    # Not on the server but archived in R2: still available, played from
+    # there by /api/source and fetched back by the endpoints that cut from it.
+    archived = None if source_path else await _archived_source(job_id)
+    if archived is not None:
+        source_duration = archived.get("duration")
     duration_estimated = source_duration is None
     if duration_estimated:
         # Best remaining scale for the source track: the last spoken word or
@@ -6818,8 +7600,8 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
                                       watermarked.clean_name(current_file))),
         "words": words_out,
         "source": {
-            "available": bool(source_path),
-            "url": _signed_source_url(job_id) if source_path else None,
+            "available": bool(source_path or archived),
+            "url": _signed_source_url(job_id) if (source_path or archived) else None,
             "duration": source_duration,
             "duration_estimated": duration_estimated,
         },
@@ -6912,6 +7694,12 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     _, canonical_range = _clip_recipe_parts(clip)
     source_path = _locate_source(req.job_id)
     source_duration = _source_duration_seconds(source_path) if source_path else None
+    # Archived in R2 (paid plan) counts as available, but is only downloaded
+    # below once the edit really needs it: a trim inside the range stays on
+    # the fast path and never pulls the source back.
+    archived = None if source_path else await _archived_source(req.job_id)
+    if archived is not None:
+        source_duration = archived.get("duration")
 
     framing = req.framing or (clip.get('recipe') or {}).get('framing') or 'auto'
     if framing not in _FRAMING_STRATEGIES:
@@ -6926,7 +7714,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
         if req.snap_to_words:
             snap_bound = source_duration or max(s['end'] for s in segments)
             segments = recut.snap_segments(segments, transcript, snap_bound)
-            if not source_path:
+            if not source_path and archived is None:
                 # Snapping trails into silence and may nudge a boundary past
                 # the canonical range; without a source the fast path is the
                 # only path, so clamp back instead of failing with a 409.
@@ -6948,6 +7736,8 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             and os.path.exists(canonical_path)
             and recut.within_range(segments, canonical_range['start'],
                                    canonical_range['end']))
+    if not fast and not source_path and archived is not None:
+        source_path = await _locate_or_fetch_source(req.job_id)
     if not fast and not source_path:
         raise HTTPException(
             status_code=409,
@@ -7016,6 +7806,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
         # captions from the transcript (in the recorded style, if any).
         if clip.get('caption_words'):
             updates['caption_words'] = None
+        updates.update(_leaves_pro_mode(clip))
         clip.update(updates)
         data['shorts'] = clips
         write_json_atomic(json_files[0], data, indent=2)
@@ -7035,12 +7826,249 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             "end": new_end,
             "duration": total,
             "render_path": "fast" if fast else "source",
+            "mode": "normal",
         }
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
         print(f"❌ Rerender Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Pro mode -----------------------------------------------------------------
+#
+# pro_mode.py re-edits a talking-head clip (dead air cut, a tighter frame that
+# changes scale on every cut, graded picture with the background dimmed). The
+# job pipeline flags the clips it fits (``pro_suggested``); this is the switch
+# the dashboard puts on every clip, both ways. The pro file is a recut of the
+# clip's current clean file, so the layers above it (hook, captions, the free
+# plan's mark) are put back exactly as the other derivations put them back.
+
+class ClipModeRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    mode: str  # "pro" | "normal"
+    # The file the dashboard is showing for this clip (same field as
+    # /api/hook and /api/subtitle).
+    input_filename: Optional[str] = None
+
+
+def _served_clip_file(job, output_dir, base_name, clip, index, asked=None):
+    """The file a clip is served from right now. The metadata only learns it
+    at the first edit (the job writes no ``video_url``), so ask in order: the
+    caller, the job's in-memory result, the metadata, the newest derived file
+    on disk. Each has to exist; the clean reframe is the last resort."""
+    clean = f"{base_name}_clip_{index + 1}.mp4"
+    mem_clips = (job.get('result') or {}).get('clips') or []
+    mem = mem_clips[index] if index < len(mem_clips) else {}
+    # What the caller names has to be a file of THIS clip: every derivation
+    # keeps the clean name as its tail.
+    asked = os.path.basename(str(asked or ''))
+    candidates = [asked if asked.endswith(clean) else None,
+                  mem.get('video_url'), clip.get('video_url'),
+                  _canonical_clip_file(output_dir, base_name, index)]
+    for candidate in candidates:
+        name = os.path.basename(str(candidate or '').split('?')[0])
+        if name and os.path.isfile(os.path.join(output_dir, name)):
+            return name
+    return clean
+
+
+# How long a switch to pro waits for a render slot of this host (pro_mode.slot)
+# before answering "busy": a person is looking at a spinner.
+PRO_WAIT_SECONDS = float(os.environ.get("PRO_WAIT_SECONDS", "20"))
+
+
+def _leaves_pro_mode(clip):
+    """Metadata updates for a clip rebuilt from the canonical file or the
+    source (rerender, manual reframe): that render is the normal look."""
+    if clip.get('mode') != 'pro':
+        return {}
+    return {'mode': 'normal', 'pro_before': None}
+
+
+def _clip_layers(clip, had_hook, had_captions):
+    """What sits on top of a clip's clean file, as one comparable value: a
+    served file can be reused only for the layers it was burned with."""
+    return json.dumps([had_hook and clip.get('auto_hook'), had_captions,
+                       had_captions and clip.get('caption_style'),
+                       had_captions and clip.get('caption_words')],
+                      sort_keys=True, default=str)
+
+
+@app.post("/api/clip/mode")
+async def set_clip_mode(req: ClipModeRequest, request: Request):
+    """Switch a clip between its normal render and pro mode."""
+    if req.mode not in ("pro", "normal"):
+        raise HTTPException(status_code=400, detail="mode must be 'pro' or 'normal'")
+    await require_managed_entitlement(request)
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    if job.get('status') != 'completed':
+        # The job rewrites the metadata when it ends: a switch made while it
+        # runs would be undone under the user's eyes.
+        raise HTTPException(
+            status_code=409,
+            detail="This video is still processing. Pro mode is available "
+                   "once all its clips are ready.")
+    _check_editor_rate(await _owner_id(request))
+
+    # Same lock as the rerenders: they all read-modify-write the metadata and
+    # replace the clip's files. It also makes a repeated click wait for the
+    # first one and get its result.
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        return await _set_clip_mode_locked(req, request, job)
+
+
+async def _set_clip_mode_locked(req: ClipModeRequest, request: Request, job):
+    import pro_mode
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip = clips[req.clip_index]
+
+    base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+    clean_name = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+    served = _served_clip_file(job, output_dir, base_name, clip, req.clip_index,
+                               req.input_filename)
+
+    def answer(**extra):
+        return {"success": True, "mode": clip.get('mode') or 'normal',
+                "new_video_url": clip.get('video_url') or f"/videos/{req.job_id}/{served}",
+                "start": clip.get('start'), "end": clip.get('end'), **extra}
+
+    if (clip.get('mode') or 'normal') == req.mode:
+        return answer(unchanged=True)
+    if not os.path.exists(os.path.join(output_dir, served)):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    # Walk the layers back to the clean file, noting which ones to put back.
+    uncaptioned = await asyncio.to_thread(
+        _strip_burned_captions, output_dir, served, False)
+    had_captions = uncaptioned != _strip_watermark_copy(output_dir, served)
+    base = _strip_burned_hook(output_dir, uncaptioned)
+    had_hook = base != uncaptioned and bool((clip.get('auto_hook') or {}).get('text'))
+    loop = asyncio.get_event_loop()
+
+    reservation_id = None
+    reuse = None
+    if req.mode == "pro":
+        base_path = os.path.join(output_dir, base)
+        # A restored project may only have the served file: with captions or
+        # a hook still burned in, the reframing would crop and scale them.
+        if (not os.path.exists(base_path) or watermarked.is_marked(base)
+                or re.match(r'^(?:subtitled_\d+_|hooked_\d+_|hook_)', base)):
+            raise HTTPException(
+                status_code=409,
+                detail="The clean render of this clip is no longer on the server, "
+                       "so it cannot be converted.")
+        minutes = _cloud_config.EDITOR_ACTION_MINUTES if BILLING_ENABLED else 0
+        reservation_id = await reserve_managed_action(request, minutes, req.job_id, "pro")
+        layers = _clip_layers(clip, had_hook, had_captions)
+        # Keyword titles need a model: the caller's entitlement decides, as
+        # for every other Gemini-backed action. None just means no titles.
+        api_key = await resolve_gemini(request)
+        hook_seconds = 0.0
+        if had_hook:
+            try:
+                hook_seconds = float((clip.get('auto_hook') or {}).get('duration_seconds') or 5.0)
+            except (TypeError, ValueError):
+                hook_seconds = 5.0
+        try:
+            new_base, updates = await loop.run_in_executor(
+                None, lambda: pro_mode.convert(
+                    base_path, clean_name, clip, data.get('transcript') or {},
+                    wait=PRO_WAIT_SECONDS, api_key=api_key, hook_seconds=hook_seconds,
+                    caption_style=CAPTION_PRESETS["cine"] if had_captions else None))
+        except Exception as e:
+            if reservation_id:
+                await _metering.release_reservation(reservation_id)
+            if isinstance(e, pro_mode.Busy):
+                raise HTTPException(
+                    status_code=503, headers={"Retry-After": "60"},
+                    detail="Pro mode is busy right now. Try again in a minute.")
+            if isinstance(e, pro_mode.NotApplicable):
+                raise HTTPException(status_code=400,
+                                    detail="Pro mode needs a vertical clip.")
+            print(f"❌ Pro mode error: {e}")
+            raise HTTPException(status_code=500, detail="Pro mode could not render this clip.")
+        # Going back reuses the file served today when nothing on it changed.
+        updates['pro_before'].update(served=_strip_watermark_copy(output_dir, served),
+                                     layers=layers)
+    else:
+        before = clip.get('pro_before') or {}
+        new_base = before.get('base') or clean_name
+        if not os.path.exists(os.path.join(output_dir, new_base)):
+            new_base = clean_name
+        if not os.path.exists(os.path.join(output_dir, new_base)):
+            raise HTTPException(status_code=409,
+                                detail="The normal render of this clip is no longer on the server.")
+        updates = pro_mode.restore(clip)
+        kept = before.get('served')
+        if (kept and os.path.exists(os.path.join(output_dir, kept))
+                and before.get('layers') == _clip_layers(
+                    {**clip, **updates}, had_hook, had_captions)):
+            reuse = kept
+
+    try:
+        # A valid state first (the clean file of the new mode, no layers), so
+        # nothing below can leave the clip pointing at the other mode's file.
+        clip.update(updates)
+        clip['video_url'] = f"/videos/{req.job_id}/{new_base}"
+        data['shorts'] = clips
+        write_json_atomic(json_files[0], data, indent=2)
+
+        def layer():
+            name = new_base
+            if had_hook:
+                hook = clip['auto_hook']
+                hooked = f"hooked_{int(time.time())}_{new_base}"
+                try:
+                    add_hook_to_video(
+                        os.path.join(output_dir, name), hook['text'],
+                        os.path.join(output_dir, hooked),
+                        position=hook.get('position') or "auto",
+                        duration=hook.get('duration_seconds'),
+                        style=hook.get('style') or "pill", font=hook.get('font'),
+                        layout_ranges=clip.get('layout_ranges'),
+                        has_captions=had_captions)
+                    name = hooked
+                except Exception as e:
+                    # The clip without its hook beats no clip.
+                    print(f"⚠️ Could not put the hook back on {new_base}: {e}")
+            if had_captions:
+                recap = _reapply_captions(req.job_id, req.clip_index,
+                                          os.path.join(output_dir, name))
+                if recap:
+                    name = os.path.basename(recap)
+            return name
+
+        final = reuse or await loop.run_in_executor(None, layer)
+        final = await _deliver(request, req.job_id, final)
+        clip['video_url'] = f"/videos/{req.job_id}/{final}"
+        write_json_atomic(json_files[0], data, indent=2)
+        mem_clips = (job.get('result') or {}).get('clips') or []
+        if req.clip_index < len(mem_clips):
+            mem_clips[req.clip_index].update(updates)
+            mem_clips[req.clip_index]['video_url'] = clip['video_url']
+        _archive_clip_edit_bg(req.job_id, req.clip_index, final)
+        if reservation_id:
+            await _metering.commit_reservation(reservation_id)
+        return answer(recipe=clip.get('recipe'))
+    except Exception as e:
+        if reservation_id:
+            await _metering.release_reservation(reservation_id)
+        print(f"❌ Clip mode error: {e}")
+        raise HTTPException(status_code=500, detail="Could not switch the clip's mode.")
 
 
 # --- Manual framing -----------------------------------------------------------
@@ -7122,7 +8150,7 @@ async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
     # since a re-render rebuilds from source using ONLY what it is sent, the
     # next save would silently drop every earlier adjustment.
     saved_overrides = clip.get('crop_overrides') or {}
-    source_path = _locate_source(job_id)
+    source_path = await _locate_or_fetch_source(job_id)
     if not source_path:
         raise HTTPException(
             status_code=409,
@@ -7307,7 +8335,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             detail="Horizontal clips keep the full frame; there is no crop to reframe.")
 
     segments, canonical_range = _clip_recipe_parts(clip)
-    source_path = _locate_source(req.job_id)
+    source_path = await _locate_or_fetch_source(req.job_id)
     if not source_path:
         raise HTTPException(
             status_code=409,
@@ -7370,6 +8398,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             'crop_overrides': {str(k): v for k, v in overrides.items()},
             'layout_ranges': layout_ranges.read(os.path.join(output_dir, _clean)),
         }
+        updates.update(_leaves_pro_mode(clip))
         clip.update(updates)
         data['shorts'] = clips
         write_json_atomic(json_files[0], data, indent=2)
@@ -7390,6 +8419,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             "start": min(s['start'] for s in segments),
             "end": max(s['end'] for s in segments),
             "framed_scenes": sorted(overrides),
+            "mode": "normal",
         }
     except Exception as e:
         if reservation_id:
@@ -8217,15 +9247,14 @@ async def _platforms_needing_reconnect(profile, platforms):
 
 
 # Posts through the managed Upload-Post account, per owner: monotonic times of
-# the last hour, and (owner, UTC day) -> count for the free plan's daily cap.
-# In memory: a restart forgets them, which only ever errs in the user's favour.
+# the last hour. In memory: a restart forgets them, which only ever errs in the
+# user's favour.
 _social_post_times: dict = {}
-_social_post_days: dict = {}
 
 
 async def _check_social_post_rate(request):
-    """429 past SOCIAL_POSTS_PER_HOUR (any plan) or SOCIAL_POSTS_PER_DAY_FREE
-    (free plan). Cloud only; counts the post being attempted."""
+    """429 past SOCIAL_POSTS_PER_HOUR (any plan). Cloud only; counts the post
+    being attempted."""
     if not BILLING_ENABLED:
         return
     user = await _user_from_request(request)
@@ -8239,17 +9268,49 @@ async def _check_social_post_rate(request):
         raise HTTPException(status_code=429, detail=(
             f"You have sent {len(times)} posts in the last hour, the most allowed. "
             "Please wait a few minutes and try again."))
-    if user.plan == "free":
-        today = datetime.now(timezone.utc).date().isoformat()
-        for k in [k for k in _social_post_days if k[1] != today]:
-            _social_post_days.pop(k, None)
-        used = _social_post_days.get((key, today), 0)
-        if used >= _cloud_config.SOCIAL_POSTS_PER_DAY_FREE:
-            raise HTTPException(status_code=429, detail=(
-                f"The free plan posts up to {_cloud_config.SOCIAL_POSTS_PER_DAY_FREE} clips a day. "
-                f"The limit resets at midnight UTC; paid plans have no daily limit: {upgrade_url('post_limit')}"))
-        _social_post_days[(key, today)] = used + 1
     times.append(now)
+
+
+# Posting to socials is part of the paid plans. A free account gets
+# FREE_SOCIAL_POSTS posts in total to try it, counted as zero-minute ledger rows
+# so a restart or a second instance cannot reset them; past them every post is
+# a 402 the dashboard turns into the plans modal. A post that fails before
+# Upload-Post takes it gives its try back.
+FREE_POST_JOB_TYPE = "social_post"
+_free_post_locks: dict = {}
+
+
+async def _claim_free_post(request, job_id):
+    """``(ledger_id, posts_left)`` for a free account's post, ``(None, None)``
+    for a paid plan or self-host; a 402 once the free posts are used."""
+    if not BILLING_ENABLED:
+        return None, None
+    user = await _user_from_request(request)
+    if user is None or getattr(user, "plan", None) != "free":
+        return None, None
+    allowance = _cloud_config.FREE_SOCIAL_POSTS
+    lock = _free_post_locks.setdefault(str(user.id), asyncio.Lock())
+    async with lock:
+        used = await _metering.free_actions_total(user.id, FREE_POST_JOB_TYPE)
+        if used >= allowance:
+            raise HTTPException(status_code=402, detail={
+                "error": "post_requires_plan",
+                "free_posts": allowance,
+                "message": (f"Posting to your socials is part of the paid plans, and this account "
+                            f"has used its {allowance} free posts. Pick a plan to keep posting."),
+                "upgrade_url": upgrade_url("post_wall"),
+            })
+        ledger_id = await _metering.record_free_action(user.id, job_id, FREE_POST_JOB_TYPE)
+    return ledger_id, allowance - used - 1
+
+
+async def _give_back_free_post(ledger_id):
+    if not ledger_id:
+        return
+    try:
+        await _metering.undo_free_action(ledger_id)
+    except Exception as e:
+        print(f"⚠️ Could not give back a free post: {type(e).__name__}")
 
 
 @app.post("/api/social/post")
@@ -8285,6 +9346,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
                 f"Reconnect {names} first: its login has expired, so the post would "
                 "fail. Use \"connect socials\" and try again."))
 
+    free_claim, free_left = await _claim_free_post(request, req.job_id)
     try:
         clip = job['result']['clips'][req.clip_index]
         # Video URL is relative /videos/..., we need absolute file path
@@ -8294,9 +9356,21 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         
         filename = clip['video_url'].split('/')[-1]
         file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-        
+
         if not os.path.exists(file_path):
-             raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
+            # The recorded file is not there (an edit that failed used to
+            # record a name it never wrote): post the newest file this clip
+            # does have, and point the clip back at it.
+            job_dir = os.path.join(OUTPUT_DIR, req.job_id)
+            meta_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+            if meta_files:
+                base_name = os.path.basename(meta_files[0]).replace('_metadata.json', '')
+                newest = _canonical_clip_file(job_dir, base_name, req.clip_index)
+                if os.path.exists(os.path.join(job_dir, newest)):
+                    filename, file_path = newest, os.path.join(job_dir, newest)
+                    clip['video_url'] = f"/videos/{req.job_id}/{newest}"
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Video file not found")
 
         # Construct parameters for Upload-Post API
         # Fallbacks
@@ -8345,9 +9419,12 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         out = response.json()
         if isinstance(out, dict) and out.get("request_id"):
             _post_request_owners[str(out["request_id"])] = await _owner_id(request)
+        if isinstance(out, dict) and free_left is not None:
+            out["free_posts_left"] = free_left
         return out
 
     except Exception as e:
+        await _give_back_free_post(free_claim)
         print(f"❌ Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -9472,6 +10549,8 @@ async def thumbnail_publish(
     if not os.path.exists(thumb_path):
         raise HTTPException(status_code=404, detail="Thumbnail file not found")
 
+    await _claim_free_post(request, session_id)
+
     # Generate a unique ID for this publish job so the frontend can poll
     publish_id = str(uuid.uuid4())
     publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None,
@@ -9795,6 +10874,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
     result = job.get("result")
     if not result or not result.get("video_url"):
         raise HTTPException(status_code=400, detail="No video available for this job")
+    await _claim_free_post(request, req.job_id)
 
     try:
         # Resolve video file path

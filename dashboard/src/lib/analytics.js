@@ -18,6 +18,12 @@ import { firstTouchProps } from './attribution';
 //                          free_queue_full; its checkouts carry source 'queue_full')
 //   - QueueFullCheckout  — a plan/top-up clicked inside that wall
 //   - QueueFullDismissed — "I'll come back later" clicked
+//   - PostWallSeen       — a free account used its free posts and the plans
+//                          modal opened (402 post_requires_plan)
+//   - PostWallCheckout   — a plan clicked inside that wall
+//   - ConnectWallSeen    — a free account tried to connect its socials and the
+//                          plans modal opened (402 connect_requires_plan)
+//   - ConnectWallCheckout — a plan clicked inside that wall
 //   - CheckoutStarted    — checkout clicked, on ANY surface (see `source` prop:
 //                          'wall' | 'upsell' | 'pricing' | 'watermark')
 //   - CheckoutRedirected — Stripe returned a URL and we are sending them there
@@ -38,6 +44,12 @@ import { firstTouchProps } from './attribution';
 //   - ClipTutorialCompleted— first Clip Generator job finished with clips
 //   - JobResumedAfterSignin— a job started signed-out was replayed after the
 //                          sign-in (App.jsx), instead of being dropped
+//   - ClipPlayed         — a result clip's first play (`clip_index`, `clips`)
+//   - ClipDownloaded     — one clip saved (`surface`: results | library;
+//                          `clip_index`, `score`)
+//   - ProjectReopened    — a past project opened again from the library
+// What people do to a clip on the server (edit tools, social post, the zip of
+// every clip) is reported by the API itself: cloud/usage_events.py.
 // The Started → Redirected → Subscribed chain is what separates "never reached
 // Stripe" from "reached Stripe and abandoned"; before 2-ago-2026 the modals
 // emitted only their own *Checkout event and the difference was invisible.

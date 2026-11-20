@@ -100,9 +100,36 @@ class TestJobDirSweep:
         app_module.jobs["live"] = {"status": "queued"}
         dead = _job_dir(out, "dead")
         (dead / "clip.mp4").write_bytes(b"x" * 2048)
+        _age(dead, OLD)
         monkeypatch.setattr(app_module, "OUTPUT_MAX_GB", 1 / 1024 ** 3)  # 1 byte
         app_module._enforce_output_size_cap()
         assert live.exists() and not dead.exists()
+
+    def test_size_cap_leaves_a_job_that_just_finished(self, disk, monkeypatch):
+        """With the queue alone over the cap, every finished job went at the
+        next sweep: an edit made minutes later lost its files mid-archive."""
+        out, _ = disk
+        fresh = _job_dir(out, "fresh")
+        (fresh / "clip.mp4").write_bytes(b"x" * 2048)
+        stale = _job_dir(out, "stale")
+        (stale / "clip.mp4").write_bytes(b"x" * 2048)
+        _age(stale, app_module.OUTPUT_CAP_GRACE_SECONDS + 60)
+        monkeypatch.setattr(app_module, "OUTPUT_MAX_GB", 1 / 1024 ** 3)  # 1 byte
+        app_module._enforce_output_size_cap()
+        assert fresh.exists() and not stale.exists()
+
+    def test_size_cap_does_not_count_the_download_cache(self, disk, monkeypatch):
+        """The cache has its own cap and this one may not delete it: counting
+        it would purge finished jobs for nothing."""
+        out, _ = disk
+        cache = out / ".source_cache"
+        cache.mkdir()
+        (cache / "q6fgVVmdpgY.mp4").write_bytes(b"x" * 8192)
+        done = _job_dir(out, "done")
+        (done / "clip.mp4").write_bytes(b"x" * 1024)
+        monkeypatch.setattr(app_module, "OUTPUT_MAX_GB", 4096 / 1024 ** 3)
+        app_module._enforce_output_size_cap()
+        assert done.exists() and (cache / "q6fgVVmdpgY.mp4").exists()
 
 
 class TestUploadSweep:
@@ -128,6 +155,75 @@ class TestUploadSweep:
         monkeypatch.setattr(app_module, "UPLOADS_MAX_GB", 1 / 1024 ** 3)
         app_module._enforce_uploads_size_cap()
         assert live.exists() and not dead.exists()
+
+    def test_size_cap_keeps_the_source_of_a_job_that_just_finished(self, disk, monkeypatch):
+        """Its clips are minutes old: the preview of the source and the edits
+        that cut from it still need the file."""
+        out, up = disk
+        fresh = _upload(up, "fresh")
+        (out / "fresh").mkdir()
+        stale = _upload(up, "stale")
+        (out / "stale").mkdir()
+        _age(out / "stale", app_module.OUTPUT_CAP_GRACE_SECONDS + 60)
+        monkeypatch.setattr(app_module, "UPLOADS_MAX_GB", 1 / 1024 ** 3)
+        app_module._enforce_uploads_size_cap()
+        assert fresh.exists() and not stale.exists()
+
+
+class TestSubmissionsStillUploading:
+    """17-nov-2026: with the uploads dir over its cap (queued jobs hold their
+    sources), every sweep deleted the file of a submission still streaming in,
+    and its new job dir: it was not in `jobs` yet, so nothing said it was live."""
+
+    @pytest.fixture
+    def in_flight(self, disk, monkeypatch):
+        monkeypatch.setattr(app_module, "_dirs_in_flight", {})
+        monkeypatch.setattr(app_module, "pending_uploads", {})
+        return disk
+
+    def test_size_caps_keep_a_submission_still_uploading(self, in_flight, monkeypatch):
+        out, up = in_flight
+        d = _job_dir(out, "arriving", age=0)
+        f = _upload(up, "arriving", age=0)
+        app_module._begin_job_dir("arriving")
+        monkeypatch.setattr(app_module, "UPLOADS_MAX_GB", 1 / 1024 ** 3)
+        monkeypatch.setattr(app_module, "OUTPUT_MAX_GB", 1 / 1024 ** 3)
+        app_module._enforce_uploads_size_cap()
+        app_module._enforce_output_size_cap()
+        assert f.exists() and d.exists()
+
+    def test_once_registered_or_refused_it_is_an_ordinary_job(self, in_flight, monkeypatch):
+        out, up = in_flight
+        f = _upload(up, "refused", age=0)
+        app_module._begin_job_dir("refused")
+        app_module._discard_rejected_source(str(f), str(out / "refused"))
+        assert not app_module._job_dir_in_flight("refused")
+        dead = _upload(up, "dead", age=0)
+        dead.write_bytes(b"x" * 2048)
+        app_module._begin_job_dir("dead")
+        app_module._end_job_dir("dead")
+        monkeypatch.setattr(app_module, "UPLOADS_MAX_GB", 1 / 1024 ** 3)
+        app_module._enforce_uploads_size_cap()
+        assert not dead.exists()
+
+    def test_a_request_that_died_does_not_pin_its_dir_forever(self, in_flight, monkeypatch):
+        app_module._begin_job_dir("ghost")
+        app_module._dirs_in_flight["ghost"] -= app_module._DIR_IN_FLIGHT_MAX_AGE + 1
+        assert not app_module._job_is_active("ghost")
+
+    def test_an_open_agent_upload_slot_is_kept(self, in_flight, monkeypatch):
+        _, up = in_flight
+        live = up / "pending_u-live_clip.mp4"
+        live.write_bytes(b"x")
+        old = up / "pending_u-old_clip.mp4"
+        old.write_bytes(b"x")
+        now = time.time()
+        app_module.pending_uploads["u-live"] = {"path": str(live), "created": now}
+        app_module.pending_uploads["u-old"] = {
+            "path": str(old), "created": now - app_module.UPLOAD_TTL_SECONDS - 1}
+        monkeypatch.setattr(app_module, "UPLOADS_MAX_GB", 1 / 1024 ** 3)
+        app_module._enforce_uploads_size_cap()
+        assert live.exists() and not old.exists()
 
 
 class TestSettleWithoutEntry:

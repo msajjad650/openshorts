@@ -261,9 +261,10 @@ THUMBNAIL_CONVERSATION_MAX_TURNS = _env_int("THUMBNAIL_CONVERSATION_MAX_TURNS", 
 DESCRIBE_TRANSCRIPT_MAX_CHARS = _env_int("DESCRIBE_TRANSCRIPT_MAX_CHARS", 200000)
 
 # Social posting through the managed Upload-Post account: posts per user and
-# hour (a scheduled week is one post per clip), and per day on the free plan.
+# hour (a scheduled week is one post per clip). Posting is part of the paid
+# plans; a free account gets this many posts in total to try it.
 SOCIAL_POSTS_PER_HOUR = _env_int("SOCIAL_POSTS_PER_HOUR", 60)
-SOCIAL_POSTS_PER_DAY_FREE = _env_int("SOCIAL_POSTS_PER_DAY_FREE", 30)
+FREE_SOCIAL_POSTS = _env_int("FREE_SOCIAL_POSTS", 3)
 
 # Agent upload slots (POST /api/uploads) a user may hold open at once.
 MAX_PENDING_UPLOADS_PER_USER = _env_int("MAX_PENDING_UPLOADS_PER_USER", 5)
@@ -464,6 +465,12 @@ class Settings:
 
 # Days a user's videos survive after their subscription ends (grace period).
 VIDEO_RETENTION_GRACE_DAYS = 7
+
+# Days a paid job's source video stays in R2 after its upload
+# (cloud/source_archive.py), so the editor can still extend a cut or reframe and
+# the source preview still plays once the server copy has aged out. 0 turns the
+# archive off, and the next sweep then deletes whatever is still stored.
+SOURCE_ARCHIVE_DAYS = max(0, _env_int("SOURCE_ARCHIVE_DAYS", 30))
 
 # How long the erasure log (cloud/models.AccountDeletion) is kept. Matches the
 # "rights declarations and related logs: up to 5 years" line in the privacy

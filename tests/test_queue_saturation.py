@@ -26,7 +26,8 @@ def env(monkeypatch):
     for k in ("QUEUE_SATURATION_DISABLED", "QUEUE_RECENT_FIRST_MINUTES",
               "QUEUE_RECENT_FIRST_RELEASE_MINUTES", "SLOW_LANE_BRAKE_HOURS",
               "SLOW_LANE_BRAKE_RELEASE_HOURS", "SLOW_LANE_BRAKE_CLIPS",
-              "QUEUE_COUNTRY_HEADER", "FREE_SLOW_LANE_COUNTRIES"):
+              "QUEUE_COUNTRY_HEADER", "FREE_SLOW_LANE_COUNTRIES",
+              "FREE_MAX_CLIPS", "FREE_QUIET_MAX_CLIPS", "FREE_QUIET_MINUTES"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("BILLING_ENABLED", "1")
     qm.reset()
@@ -294,6 +295,38 @@ class TestSubmit:
         assert app_module._submissions_in_flight("u-free") == 0
         assert qm.current()["brake"]["rejected"] == 1
 
+    def test_a_braked_account_gets_no_cost_line_and_spends_no_probe(self, managed, sat):
+        probed = []
+
+        async def run_probe(url, allow_paid=False):
+            probed.append(url)
+            return 12.0
+        managed.met.run_probe = run_probe
+        managed.met.balance["remaining"] = 60.0
+        sat.setattr(app_module, "_probe_cache", {})
+        sat.setattr(app_module, "_probe_times", {})
+
+        def estimate(country, url="https://youtu.be/abcdefghijk"):
+            return asyncio.run(app_module.process_estimate(
+                app_module.EstimateRequest(url=url), _request(country)))
+
+        _set_brake(True)
+        # The submit of this account would be refused: nothing is asked of YouTube.
+        assert estimate("XA") == {"billing": True, "outcome": None}
+        assert probed == [] and app_module._probe_times == {}
+        # Another lane, bought minutes, or the brake off: the cost line as always.
+        assert estimate("XC")["outcome"] is not None and len(probed) == 1
+        managed.met.balance["topup_remaining"] = 30.0
+        assert estimate("XA", "https://youtu.be/bbbbbbbbbbb")["outcome"] is not None
+        managed.met.balance["topup_remaining"] = 0.0
+        _set_brake(False)
+        assert estimate("XA", "https://youtu.be/ccccccccccc")["outcome"] is not None
+        assert len(probed) == 3
+        # A length this account already knows costs nothing to show, brake or not.
+        _set_brake(True)
+        assert estimate("XA", "https://youtu.be/ccccccccccc")["outcome"] is not None
+        assert len(probed) == 3
+
     def test_brake_lets_other_lanes_and_paid_through(self, managed):
         _set_brake(True)
         assert _reserve(_request("XC"), "j2")[1] == FREE
@@ -549,6 +582,103 @@ class TestBrakeClips:
         assert self._dispatch(out, monkeypatch) == ["slow1"]
         assert "CLIP_TARGET_MAX" not in app_module.jobs["slow1"]["env"]
 
+    def test_free_plan_cap_is_decided_at_dispatch(self, sat):
+        cap = app_module._cap_clips_at_dispatch
+        job = {"env": {}, "logs": [], "watermark": True}
+        cap(job, FREE)
+        assert "CLIP_TARGET_MAX" not in job["env"]          # unset: no cap
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        cap(job, FREE)
+        assert job["env"]["CLIP_TARGET_MIN"] == job["env"]["CLIP_TARGET_MAX"] == "2"
+        assert job["logs"][-1] == app_module.FREE_CLIPS_LOG.format(n=2)
+        from log_view import friendly_logs
+        assert friendly_logs([job["logs"][-1]]) == [job["logs"][-1]]
+        # The user's own smaller target stays.
+        job = {"env": {"CLIP_TARGET_MIN": "1", "CLIP_TARGET_MAX": "1"}, "logs": [],
+               "watermark": True}
+        cap(job, FREE)
+        assert job["env"]["CLIP_TARGET_MAX"] == "1"
+
+    def test_free_plan_cap_never_reaches_a_paid_job(self, sat):
+        cap = app_module._cap_clips_at_dispatch
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        for job, prio in (({"env": {}, "logs": [], "watermark": True}, 1),       # paid since
+                          ({"env": {}, "logs": [], "watermark": False}, FREE),   # no mark
+                          ({"env": {}, "logs": [], "watermark": True, "topup": True}, FREE)):
+            cap(job, prio)
+            assert "CLIP_TARGET_MAX" not in job["env"]
+
+    def _measured(self, normal, slow, age=0.0):
+        s = qm.current()
+        s["figures"] = {"normal": {"queued": 1, "wait": normal},
+                        "slow": {"queued": 1, "wait": slow}}
+        s["measured_at"] = time.time() - age
+        qm.adopt(s)
+
+    def test_a_short_queue_lifts_the_free_cap(self, sat):
+        """Idle hardware: more clips are what a new user judges the product by."""
+        cap = app_module._cap_clips_at_dispatch
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        sat.setenv("FREE_QUIET_MAX_CLIPS", "4")
+        self._measured(normal=120, slow=300)
+        job = {"env": {}, "logs": [], "watermark": True}
+        cap(job, FREE)
+        assert job["env"]["CLIP_TARGET_MIN"] == job["env"]["CLIP_TARGET_MAX"] == "4"
+        assert job["logs"][-1] == app_module.FREE_CLIPS_LOG.format(n=4)
+
+    def test_people_waiting_in_any_lane_keep_the_cap_low(self, sat):
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        sat.setenv("FREE_QUIET_MAX_CLIPS", "4")
+        for normal, slow in ((120, 3600), (900, 0), (600, 600)):
+            self._measured(normal=normal, slow=slow)
+            assert qm.free_clip_cap() == 2, (normal, slow)
+        sat.setenv("FREE_QUIET_MINUTES", "30")
+        assert qm.free_clip_cap() == 4
+
+    def test_the_cap_is_not_lifted_on_a_stale_or_missing_measurement(self, sat):
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        sat.setenv("FREE_QUIET_MAX_CLIPS", "4")
+        assert qm.free_clip_cap() == 2                      # never measured
+        self._measured(normal=0, slow=0, age=qm.QUIET_FIGURES_MAX_AGE + 60)
+        assert qm.free_clip_cap() == 2                      # the watch is behind
+        self._measured(normal=0, slow=0)
+        assert qm.free_clip_cap() == 4
+        sat.setenv("QUEUE_SATURATION_DISABLED", "1")
+        assert qm.free_clip_cap() == 2                      # nobody is measuring
+
+    def test_the_quiet_cap_only_ever_raises_a_cap(self, sat):
+        self._measured(normal=0, slow=0)
+        sat.setenv("FREE_QUIET_MAX_CLIPS", "4")
+        assert qm.free_clip_cap() == 0                      # no cap to lift
+        sat.setenv("FREE_MAX_CLIPS", "5")
+        assert qm.free_clip_cap() == 5                      # never lowers it
+        sat.setenv("FREE_QUIET_MAX_CLIPS", "nonsense")
+        assert qm.free_clip_cap() == 5
+
+    def test_a_decision_stamps_its_measurement(self, sat):
+        state, _ = qm.decide(qm.default_state(), {"normal": {"queued": 0, "wait": 0},
+                                                  "slow": {"queued": 0, "wait": 0}}, 1000.0)
+        assert state["measured_at"] == 1000.0
+        qm.adopt(state)
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        sat.setenv("FREE_QUIET_MAX_CLIPS", "4")
+        assert qm.free_clip_cap(now=1060.0) == 4
+        assert qm.free_clip_cap(now=1000.0 + qm.QUIET_FIGURES_MAX_AGE + 1) == 2
+
+    def test_the_lower_of_the_free_cap_and_the_brake_wins(self, sat):
+        cap = app_module._cap_clips_at_dispatch
+        sat.setenv("FREE_MAX_CLIPS", "2")
+        _set_brake(True)
+        job = {"env": {}, "logs": [], "watermark": True}
+        cap(job, SLOW)
+        assert job["env"]["CLIP_TARGET_MAX"] == "2"
+        assert job["logs"][-1] == app_module.FREE_CLIPS_LOG.format(n=2)
+        sat.setenv("FREE_MAX_CLIPS", "5")
+        job = {"env": {}, "logs": [], "watermark": True}
+        cap(job, SLOW)
+        assert job["env"]["CLIP_TARGET_MAX"] == "3"
+        assert job["logs"][-1] == app_module.BRAKE_CLIPS_LOG.format(n=3)
+
 
 # --- Starved jobs ---------------------------------------------------------------------
 
@@ -683,7 +813,7 @@ class TestWatch:
                             "slow": {"queued": 300, "wait": 13 * H}}}
         from cloud import alerts
 
-        async def fake_send(subject, body):
+        async def fake_send(subject, body, **kw):
             w.sent.append((subject, body))
         monkeypatch.setattr(alerts, "send_admin_alert", fake_send)
         qw.configure(snapshot=lambda: dict(w.snap), busy_elsewhere=lambda: 0,

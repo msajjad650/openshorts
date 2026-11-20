@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Loader2, Check, Zap, Clock } from 'lucide-react';
 import { apiJson } from '../lib/api';
 import { track } from '../lib/analytics';
 import { useBackFromStripe } from '../lib/backFromStripe';
+import { useAuth } from '../contexts/AuthContext';
 import Modal from './ui/Modal';
 
 // Opens when a job hits a 402 (quota exceeded). This is the highest-intent
@@ -52,6 +53,13 @@ const PLAN_BLURBS = {
 // (QueueFullSeen / QueueFullCheckout / QueueFullDismissed, plus the shared
 // CheckoutStarted/Redirected with source 'queue_full') keep it out of the quota
 // wall's numbers. The copy never says why the queue is full for this user.
+// context 'post_wall': a free account used its few free posts (402
+// post_requires_plan). Posting is what is being sold, so the cards lead with it
+// and the one-time packs are hidden: minutes do not unlock posting.
+// A subscriber who hits the wall (plan minutes used before the renewal) cannot
+// buy a second plan: the checkout refuses it. Their wall leads with the one-time
+// packs, open and as the main action, names the day the plan's minutes come
+// back, and shows no plan cards.
 // partialJob: { processed_minutes, total_minutes } of the job on screen when the
 // "clip the whole video" banner opened it, so the copy talks about the rest of
 // that video instead of the watermark.
@@ -60,21 +68,40 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
                                      highlight: highlightPlan = 'creator', partialJob = null }) {
   const [plans, setPlans] = useState([]);
   const [topups, setTopups] = useState([]);
+  const { plan: accountPlan, me } = useAuth();
   const [showTopups, setShowTopups] = useState(false);
   const [busyPrice, setBusyPrice] = useState(null);
-  useBackFromStripe(() => setBusyPrice(null));
+  // Same-tick guard against a double click before the buttons re-render.
+  const inFlightRef = useRef(false);
+  useBackFromStripe(() => { inFlightRef.current = false; setBusyPrice(null); });
   const isUpsell = context === 'upsell';
   const isQueueFull = context === 'queue_full';
+  // 'connect_wall': a free account tried to connect its socials (402
+  // connect_requires_plan). Same offer as the post wall, its own words.
+  const isConnectWall = context === 'connect_wall';
+  const isPostWall = context === 'post_wall' || isConnectWall;
   // Opened from a video waiting in line (App's queue notice): the reason to
   // pay here is the wait, not the watermark.
   const fromQueue = isUpsell && sourceOverride === 'queue';
-  const source = sourceOverride || (isUpsell ? 'upsell' : isQueueFull ? 'queue_full' : 'wall');
-  const seenEvent = isUpsell ? 'UpsellModalSeen' : isQueueFull ? 'QueueFullSeen' : 'QuotaWallSeen';
-  const checkoutEvent = isUpsell ? 'UpsellModalCheckout' : isQueueFull ? 'QueueFullCheckout' : 'QuotaWallCheckout';
+  const source = sourceOverride || (isUpsell ? 'upsell' : isQueueFull ? 'queue_full'
+    : isConnectWall ? 'connect_wall' : isPostWall ? 'post_wall' : 'wall');
+  const seenEvent = isUpsell ? 'UpsellModalSeen' : isQueueFull ? 'QueueFullSeen'
+    : isConnectWall ? 'ConnectWallSeen' : isPostWall ? 'PostWallSeen' : 'QuotaWallSeen';
+  const checkoutEvent = isUpsell ? 'UpsellModalCheckout' : isQueueFull ? 'QueueFullCheckout'
+    : isConnectWall ? 'ConnectWallCheckout' : isPostWall ? 'PostWallCheckout' : 'QuotaWallCheckout';
+  // Out of plan minutes with a live plan: packs first (see the header comment).
+  const packsFirst = !isUpsell && !isQueueFull && !isPostWall && !!accountPlan && accountPlan !== 'free';
+  const renewsOn = (() => {
+    if (!me?.period_end) return null;
+    try {
+      return new Date(me.period_end).toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+    } catch (_) { return null; }
+  })();
 
   useEffect(() => {
     track(seenEvent,
-          { props: { required: required ?? null, remaining: remaining ?? null, source } });
+          { props: { required: required ?? null, remaining: remaining ?? null, source,
+                     account_plan: accountPlan || null, packs_first: packsFirst ? '1' : '0' } });
     apiJson('/api/billing/plans')
       .then((d) => {
         const monthly = (d.plans || []).filter((p) => p.interval === 'month');
@@ -97,8 +124,11 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
   // CheckoutFailed (we don't) separates them.
 
   const buy = async (entry, kind) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setBusyPrice(entry.price_id);
-    const props = { kind, plan: entry.plan || null, minutes: entry.minutes, source };
+    const props = { kind, plan: entry.plan || null, minutes: entry.minutes, source,
+                    account_plan: accountPlan || null };
     track(checkoutEvent, { props });
     track('CheckoutStarted', { props });
     // Same stash PricingSection sets, so a plan bought from the modal also
@@ -121,6 +151,7 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
       window.location.href = url;
     } catch (e) {
       track('CheckoutFailed', { props: { ...props, reason: String(e?.detail || e?.message || 'unknown').slice(0, 120) } });
+      inFlightRef.current = false;
       setBusyPrice(null);
       alert(e?.detail || 'Could not start checkout.');
     }
@@ -135,19 +166,29 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
   // so that case reads as "out of minutes", not "this video is 1 min long".
   const blockedByLength = typeof required === 'number' && typeof remaining === 'number'
     && remaining >= 1 && required > remaining;
-  const partialOffer = !isUpsell && !isQueueFull && partialMinutes > 0 && typeof onPartial === 'function';
+  const partialOffer = !isUpsell && !isQueueFull && !isPostWall && partialMinutes > 0 && typeof onPartial === 'function';
   const remainingShown = Math.max(0, Math.round((remaining || 0) * 10) / 10);
 
   return (
-    <Modal isOpen onClose={onClose} eyebrow="UPGRADE"
+    <Modal isOpen onClose={onClose} eyebrow={packsFirst ? 'ADD MINUTES' : 'UPGRADE'}
            title={isQueueFull ? 'The free queue is full right now'
+             : isConnectWall ? 'Post your clips to your socials'
+             : isPostWall ? 'Keep posting to your socials'
              : isUpsell
              ? (partialJob ? 'Clip the whole video' : fromQueue ? 'Skip the line' : 'Keep your clips forever')
              : (blockedByLength ? 'Your video is ready to clip' : "You've used this month's minutes")}
            size="xl">
       {/* Goal-gradient framing: they're one step from the thing they came for. */}
       <p className="text-muted text-sm mb-5">
-        {isQueueFull
+        {isConnectWall
+          ? <>Connecting your social accounts is part of the paid plans: every clip goes to{' '}
+              <b className="text-ink font-medium">TikTok, Instagram, YouTube</b> and the rest of your
+              accounts, scheduled or right away, with no watermark.</>
+          : isPostWall
+          ? <>You have used the free posts that come with the free plan. Posting is part of the
+              paid plans: every clip goes to <b className="text-ink font-medium">TikTok, Instagram,
+              YouTube</b> and the rest of your accounts, scheduled or right away, with no watermark.</>
+          : isQueueFull
           ? <>Come back later, or skip the line with a plan: paid videos go to the{' '}
               <b className="text-ink font-medium">front of the queue</b>. Nothing was charged and your
               free minutes are still yours.</>
@@ -166,9 +207,13 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
                 upgrade now and the clips you already made <b className="text-ink font-medium">lose the mark on the spot</b>.</>)
           : blockedByLength
             ? <>This video is <b className="text-ink font-medium">{required} min</b> long and you have{' '}
-                <b className="text-ink font-medium">{remainingShown} min</b> left this month. Pick a plan and
-                clip the whole video.</>
-            : <>Your minutes renew next month. Pick a plan to keep clipping now.</>}
+                <b className="text-ink font-medium">{remainingShown} min</b> left this month.{' '}
+                {packsFirst ? 'Add minutes with a one-time pack' : 'Pick a plan'} and clip the whole video.</>
+            : packsFirst
+            ? <>Your <span className="capitalize">{accountPlan}</span> minutes come back{' '}
+                <b className="text-ink font-medium">{renewsOn ? `on ${renewsOn}` : 'at your next renewal'}</b>.
+                Add minutes with a one-time pack and keep clipping now.</>
+            : <>Your minutes come back {renewsOn ? `on ${renewsOn}` : 'next month'}. Pick a plan to keep clipping now.</>}
       </p>
 
       {isQueueFull && (
@@ -194,7 +239,33 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
         </div>
       )}
 
-      <div className="grid sm:grid-cols-3 gap-3">
+      {packsFirst && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          {topups.map((t) => (
+            <div key={t.price_id} className="card p-5 flex flex-col">
+              <div className="mb-1 flex items-baseline gap-1.5">
+                <span className="font-display text-3xl text-ink tabular-nums">+{t.minutes}</span>
+                <span className="readout">min</span>
+              </div>
+              <p className="text-sm text-ink2 mb-4 flex-1">
+                {fmt(t.amount, t.currency)}, one-time. Added to your account as soon as you pay, on top of your plan.
+              </p>
+              <button onClick={() => buy(t, 'topup')} disabled={busyPrice !== null} className="w-full btn-primary">
+                {busyPrice === t.price_id
+                  ? <Loader2 size={18} className="animate-spin" />
+                  : `Add ${t.minutes} min for ${fmt(t.amount, t.currency)}`}
+              </button>
+            </div>
+          ))}
+          {topups.length === 0 && (
+            <div className="sm:col-span-2 flex justify-center py-8">
+              <Loader2 className="animate-spin text-brass" />
+            </div>
+          )}
+        </div>
+      )}
+
+      {!packsFirst && <div className="grid sm:grid-cols-3 gap-3">
         {plans.map((entry) => {
           const highlight = entry.plan === highlightPlan;
           return (
@@ -212,6 +283,12 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
                 <span className="readout">/mo</span>
               </div>
               <ul className="space-y-1.5 text-sm text-ink2 mb-4 flex-1">
+                {isPostWall && (
+                  <li className="flex items-start gap-2">
+                    <Check size={15} className="text-ok shrink-0 mt-0.5" />
+                    <span><b>Post every clip</b> to your socials</span>
+                  </li>
+                )}
                 <li className="flex items-start gap-2">
                   <Check size={15} className="text-ok shrink-0 mt-0.5" />
                   <span><b>{entry.minutes} min</b> every month ({Math.round(entry.minutes / 20)}× your free quota)</span>
@@ -244,10 +321,11 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
             <Loader2 className="animate-spin text-brass" />
           </div>
         )}
-      </div>
+      </div>}
 
-      {/* Secondary escape hatch: one-time packs, deliberately de-emphasized. */}
-      <div className="mt-4 text-center">
+      {/* Secondary escape hatch: one-time packs, deliberately de-emphasized.
+          Not on the post wall: a pack adds minutes, it does not unlock posting. */}
+      {!isPostWall && !packsFirst && <div className="mt-4 text-center">
         {!showTopups ? (
           <button onClick={() => setShowTopups(true)}
                   className="text-xs text-muted underline underline-offset-2 lowercase hover:text-ink2">
@@ -271,7 +349,7 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
             )}
           </div>
         )}
-      </div>
+      </div>}
     </Modal>
   );
 }
